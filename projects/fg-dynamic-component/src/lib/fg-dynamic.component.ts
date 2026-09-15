@@ -70,18 +70,22 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * and before the view and content children are checked.
      */
     async ngOnChanges(): Promise<void> {
-        // Lazy-load a component.
-        await this.loadComponentAsync();
-        // Instantiates a single component and inserts its host view into this container.
-        this.createComponent();
-        // Updates specified input names to new values.
-        this.setInputs();
-        // Disables/enables the control.
-        this.setFormControlStatus();
-        // Add synchronous validators to this control.
-        this.setFormControlValidators();
-        // Set attribute values for an element in the DOM.
-        this.setAttributes();
+        try {
+            // Lazy-load a component.
+            await this.loadComponentAsync();
+            // Instantiates a single component and inserts its host view into this container.
+            this.createComponent();
+            // Updates specified input names to new values.
+            this.setInputs();
+            // Disables/enables the control.
+            this.setFormControlStatus();
+            // Add synchronous validators to this control.
+            this.setFormControlValidators();
+            // Set attribute values for an element in the DOM.
+            this.setAttributes();
+        } catch (error) {
+            console.error('[fg-dynamic] Error during component initialization:', error);
+        }
     }
 
     /**
@@ -137,7 +141,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         if (this._component && !this._componentRef && this._viewContainerRef() && !this._formControlDirective) {
             let injector: Injector;
 
-            if (this.formGroup() && this.configuration()?.attributes && this.configuration().attributes['name'] && typeof(this.evaluateExpression(this.configuration().attributes['name'], this.viewModel)) === 'string' && this.viewModel()) {
+            if (this.formGroup() && this.configuration()?.attributes && this.configuration().attributes['name'] && typeof(this.evaluateExpression(this.configuration().attributes['name'], this.viewModel)) === 'string' && this.viewModel() != null) {
                 // Synchronizes a standalone FormControl instance to a form control element.
                 this._formControlDirective = new FormControlDirective(null, null, null, null);
 
@@ -196,7 +200,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * Construct a FormControl with an initial value.
      */
     private createFormControl(): void {
-        if (this.formGroup() && this.configuration()?.attributes && this.configuration().attributes['name'] && this.viewModel()) {
+        if (this.formGroup() && this.configuration()?.attributes && this.configuration().attributes['name'] && this.viewModel() != null) {
             // Evaluates JavaScript code and executes it.
             const name = this.evaluateExpression(this.configuration().attributes['name'], this.viewModel) as string;
 
@@ -267,7 +271,24 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * Add synchronous validators to this control.
      */
     private setFormControlValidators(): void {
-        if (this._formControl && this.configuration()?.attributes && Object.keys(this.configuration().attributes).length > 0 && this._componentRef?.location?.nativeElement) {
+        if (!this._formControl) {
+            return;
+        }
+
+        // Always remove previously managed validators, even when the current
+        // configuration has no validator-bearing attributes.
+        if (this._managedValidatorFns.length > 0) {
+            this._formControl.removeValidators(this._managedValidatorFns);
+            
+            this._managedValidatorFns = [];
+            
+            this._formControl.updateValueAndValidity({
+                onlySelf: true,
+                emitEvent: false
+            });
+        }
+
+        if (this.configuration()?.attributes && Object.keys(this.configuration().attributes).length > 0 && this._componentRef?.location?.nativeElement) {
             const validators: ValidatorFn[] = [];
             // Validator that requires the control's value to be greater than or equal to the provided number.
             const min = this.evaluateExpression(this.configuration().attributes['min'], this.viewModel) as number;
@@ -318,12 +339,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 validators.push(Validators.pattern(pattern));
             }
 
-            // Remove only previously managed validators, preserving any programmatic ones
-            // added outside of this component's configuration.
-            if (this._managedValidatorFns.length > 0) {
-                this._formControl.removeValidators(this._managedValidatorFns);
-            }
-
+            // Track and add the newly built managed validators.
             this._managedValidatorFns = validators;
 
             this._formControl.addValidators(this._managedValidatorFns);
