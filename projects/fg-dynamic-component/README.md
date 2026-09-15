@@ -39,7 +39,7 @@ Then in your component's template include `<fg-dynamic>` where you want to rende
 and bind from your component class type of component to render:
 
 ```ts
-import { FGDynamicService, FGDynamicItem } from "fg-dynamic-component";
+import { FGDynamicService, IFGDynamicItem } from "fg-dynamic-component";
 
 FGDynamicService.registerComponent("MyDynamicComponent1", MyDynamicComponent1);
 FGDynamicService.registerComponent("MyDynamicComponent4", import("...").then(m => m.MyDynamicComponent4));
@@ -72,7 +72,7 @@ class MyComponent {
                 type: () => import("...").then(m => m.MyDynamicComponent7)
             }
         ]
-    } as FGDynamicItem);
+    } as IFGDynamicItem);
 }
 ```
 
@@ -81,7 +81,7 @@ class MyComponent {
 You may use `<fg-dynamic>` as a standalone component:
 
 ```ts
-import { FGDynamicComponent, FGDynamicService, FGDynamicItem } from "fg-dynamic-component";
+import { FGDynamicComponent, FGDynamicService, IFGDynamicItem } from "fg-dynamic-component";
 
 FGDynamicService.registerComponent("MyDynamicComponent4", import("...").then(m => m.MyDynamicComponent4));
 FGDynamicService.registerComponent("MyDynamicComponent5", async () => (await import("...")).MyDynamicComponent5);
@@ -114,7 +114,7 @@ class MyComponent {
                 type: () => import("...").then(m => m.MyDynamicComponent7)
             }
         ]
-    } as FGDynamicItem);
+    } as IFGDynamicItem);
 }
 ```
 
@@ -141,7 +141,7 @@ class MyComponent {
         outputs: {
             onSomething: (type) => alert(type)
         }
-    } as FGDynamicItem);
+    } as IFGDynamicItem);
 }
 
 @Component({
@@ -177,7 +177,7 @@ class MyComponent {
     outputs: {
         onSomething: '$vm.update(viewModel => { ...viewModel, message: $event, count: viewModel.count + 1 })'
     }
-  } as FGDynamicItem);
+  } as IFGDynamicItem);
   viewModel = model({ message: 'Hello World!', count: 0  });
 }
 
@@ -212,7 +212,7 @@ class MyComponent {
             class: "some classes",
             disabled: "$vm().isDisabled"
         }
-    } as FGDynamicItem);
+    } as IFGDynamicItem);
     viewModel = model({ isDisabled: true });
 }
 ```
@@ -247,7 +247,7 @@ class MyComponent {
             maxlength: 20,
             required: true
         }
-    } as FGDynamicItem);
+    } as IFGDynamicItem);
     viewModel = model({ data: { firstName: "Jhon" }, metadata: { firstName: { disabled: false } } });
     formGroup = signal(new FormGroup({}));
 }
