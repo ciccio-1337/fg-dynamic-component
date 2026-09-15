@@ -1,6 +1,6 @@
 {
   "name": "fg-dynamic-component",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "author": "Francesco Guagnano <guagnanofrancesco11@gmail.com>",
   "license": "MIT",
   "repository": {
@@ -18,11 +18,8 @@
     "life-cycle"
   ],
   "peerDependencies": {
-    "@angular/common": "17.2.4",
-    "@angular/core": "17.2.4"
-  },
-  "dependencies": {
-    "tslib": "2.6.2"
+    "@angular/common": "22.1.6",
+    "@angular/core": "22.1.6"
   },
   "sideEffects": false
 }

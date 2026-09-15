@@ -7,6 +7,7 @@ Create an Angular standalone signals based dynamic components tree through a JSO
 
 | Angular | fg-dynamic-component | NPM package                   |
 | ------- | -------------------- | ----------------------------- |
+| 22.1.6  | 2.0.0                | `fg-dynamic-component@^2.0.0` |
 | 17.2.4  | 1.1.1                | `fg-dynamic-component@^1.1.1` |
 | 17.2.4  | 1.1.0                | `fg-dynamic-component@^1.1.0` |
 | 17.2.4  | 1.0.2                | `fg-dynamic-component@^1.0.2` |
