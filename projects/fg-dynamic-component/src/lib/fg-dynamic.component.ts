@@ -2,12 +2,12 @@ import { ChangeDetectionStrategy, Component, ComponentRef, ElementRef, EventEmit
 import { ControlValueAccessor, FormControl, FormControlDirective, FormGroup, NG_VALUE_ACCESSOR, NgControl, ValidatorFn, Validators } from '@angular/forms';
 import { Subscription } from 'rxjs';
 
-export interface FGDynamicItem {
+export interface IFGDynamicItem {
     type?: string | Type<unknown> | Promise<Type<unknown>> | (() => Promise<Type<unknown>>);
     inputs?: Record<string, string | unknown>;
     outputs?: Record<string, string | Function>;
     attributes?: Record<string, string | unknown>;
-    items?: FGDynamicItem[];
+    items?: IFGDynamicItem[];
 }
 
 /**
@@ -40,10 +40,11 @@ export class FGDynamicService {
         }
     `,
 	changeDetection: ChangeDetectionStrategy.OnPush,
-	standalone: true
+	standalone: true,
+	styles: [`:host { display: contents; }`]
 })
 export class FGDynamicComponent implements OnChanges, OnDestroy {
-	configuration: InputSignal<FGDynamicItem> = input.required<FGDynamicItem>();
+	configuration: InputSignal<IFGDynamicItem> = input.required<IFGDynamicItem>();
 	viewModel: ModelSignal<unknown> = model<unknown>();
 	formGroup: InputSignal<FormGroup> = input<FormGroup>();
 
@@ -54,12 +55,12 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         read: ElementRef
     });
 	private _componentRef: ComponentRef<unknown>;
-    private _elementRef: ElementRef<HTMLElement> = inject(ElementRef);
     private _renderer: Renderer2 = inject(Renderer2);
     private _outputsSubscriptions: Subscription[] = [];
     private _formControl: FormControl;
     private _formControlDirective: FormControlDirective;
     private _formControlSubscription: Subscription;
+    private _managedValidatorFns: ValidatorFn[] = [];
     private _component: Type<unknown>;
     private _injector: Injector = inject(Injector);
 
@@ -73,8 +74,6 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         await this.loadComponentAsync();
         // Instantiates a single component and inserts its host view into this container.
         this.createComponent();
-        // Remove the fg-dynamic tag.
-        this.removeHostElement();
         // Updates specified input names to new values.
         this.setInputs();
         // Disables/enables the control.
@@ -89,25 +88,39 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * A method to lazy-load a component.
      */
     private async loadComponentAsync(): Promise<void> {
-        if (this.configuration().type != null && !this._component) {
-            let type: Type<unknown> | Promise<Type<unknown>> | (() => Promise<Type<unknown>>);
+        const configurationType: string | Type<unknown> | Promise<Type<unknown>> | (() => Promise<Type<unknown>>) = this.configuration().type;
 
-            if (typeof(this.configuration().type) === 'string') {
-                type = FGDynamicService.getComponent(this.configuration().type as string);
-            } else {
-                type = this.configuration().type as Type<unknown> | Promise<Type<unknown>> | (() => Promise<Type<unknown>>);
+        if (configurationType != null) {
+            const requestedType: Type<unknown> | Promise<Type<unknown>> | (() => Promise<Type<unknown>>) | undefined = typeof configurationType === 'string'
+                ? FGDynamicService.getComponent(configurationType)
+                : configurationType as Type<unknown> | Promise<Type<unknown>> | (() => Promise<Type<unknown>>);
+
+            if (requestedType == null) {
+                return;
             }
 
-            try {
-                type = (type as () => Promise<Type<unknown>>)();
-            } catch {
-                type = type;
-            } finally {
-                if (type instanceof Promise) {
-                    this._component = await type;
-                } else {
-                    this._component = type as Type<unknown>;
+            let resolvedType: Type<unknown>;
+
+            if (typeof requestedType === 'function') {
+                // Try to invoke as a lazy loader function: () => Promise<Type<unknown>>
+                try {
+                    const result: Promise<Type<unknown>> = (requestedType as () => Promise<Type<unknown>>)();
+
+                    resolvedType = result instanceof Promise ? await result : result as Type<unknown>;
+                } catch {
+                    // Not a lazy loader function, treat it as a direct Type
+                    resolvedType = requestedType as Type<unknown>;
                 }
+            } else if (requestedType instanceof Promise) {
+                resolvedType = await requestedType;
+            } else {
+                resolvedType = requestedType as Type<unknown>;
+            }
+
+            // Only re-assign when the resolved type actually changed, so that subsequent
+            // input/attribute updates don't tear down the already-instantiated component.
+            if (this._component !== resolvedType) {
+                this._component = resolvedType;
             }
         }
     }
@@ -116,6 +129,11 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * Instantiates a single component and inserts its host view into this container.
      */
     private createComponent(): void {
+        // If the component type changed, clean up and recreate it.
+        if (this._componentRef && this._component !== this._componentRef.componentType) {
+            this.cleanup();
+        }
+
         if (this._component && !this._componentRef && this._viewContainerRef() && !this._formControlDirective) {
             let injector: Injector;
 
@@ -150,24 +168,6 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             this.handleOutputs();
             // Construct a FormControl with an initial value.
             this.createFormControl();
-        }
-    }
-
-    /**
-     * A method to remove the fg-dynamic tag.
-     */
-    private removeHostElement(): void {
-        if (this._elementRef?.nativeElement?.parentElement) {
-            const nativeElement: HTMLElement = this._elementRef.nativeElement;
-            const parentElement: HTMLElement = nativeElement.parentElement;
-
-            // Move all children out of the element
-            while (nativeElement.firstChild) {
-                parentElement.insertBefore(nativeElement.firstChild, nativeElement);
-            }
-
-            // Remove the empty element (the host)
-            parentElement.removeChild(nativeElement);
         }
     }
 
@@ -212,8 +212,15 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 
                 // A multicasting observable that emits an event every time the value of the control changes, in the UI or programmatically.
                 this._formControlSubscription = this._formControl.valueChanges.subscribe((value: unknown): void => {
-                    // Creates a deep clone of an object.
-                    const viewModel: unknown = structuredClone(this.viewModel());
+                    // Creates a deep clone of an object, falling back to a JSON round-trip
+                    // when the view model contains non-cloneable values (functions, DOM nodes, ...).
+                    let viewModel: unknown;
+
+                    try {
+                        viewModel = structuredClone(this.viewModel());
+                    } catch {
+                        viewModel = JSON.parse(JSON.stringify(this.viewModel()));
+                    }
 
                     // Sets the value at path of object.
                     // If a portion of path doesn't exist, it's created.
@@ -293,14 +300,14 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             // Validator that requires the length of the control's value to be less than or equal to the provided maximum length.
             const maxLength = this.evaluateExpression(this.configuration().attributes['maxlength'], this.viewModel) as number;
 
-            if (maxLength > 0 && maxLength.toString() !== this._componentRef.location.nativeElement.getAttribute('maxlength')) {
+            if (maxLength >= 0 && maxLength.toString() !== this._componentRef.location.nativeElement.getAttribute('maxlength')) {
                 validators.push(Validators.maxLength(maxLength));
             }
 
             // Validator that requires the length of the control's value to be greater than or equal to the provided minimum length.
             const minLength = this.evaluateExpression(this.configuration().attributes['minlength'], this.viewModel) as number;
 
-            if (minLength > 0 && minLength.toString() !== this._componentRef.location.nativeElement.getAttribute('minlength')) {
+            if (minLength >= 0 && minLength.toString() !== this._componentRef.location.nativeElement.getAttribute('minlength')) {
                 validators.push(Validators.minLength(minLength));
             }
 
@@ -311,17 +318,21 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 validators.push(Validators.pattern(pattern));
             }
 
-            if (validators.length > 0) {
-                // Empties out the synchronous validator list.
-                this._formControl.clearValidators();
-                // Add a synchronous validator or validators to this control, without affecting other validators.
-                this._formControl.addValidators(validators);
-                // Recalculates the value and validation status of the control.
-                this._formControl.updateValueAndValidity({
-                    onlySelf: true,
-                    emitEvent: false
-                });
+            // Remove only previously managed validators, preserving any programmatic ones
+            // added outside of this component's configuration.
+            if (this._managedValidatorFns.length > 0) {
+                this._formControl.removeValidators(this._managedValidatorFns);
             }
+
+            this._managedValidatorFns = validators;
+
+            this._formControl.addValidators(this._managedValidatorFns);
+            // Recalculates the value and validation status of the control whenever the
+            // managed validator set changes (including when it becomes empty).
+            this._formControl.updateValueAndValidity({
+                onlySelf: true,
+                emitEvent: false
+            });
         }
     }
 
@@ -330,7 +341,9 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      */
     private attachFormControlDirective(): void {
         if (this._formControlDirective && this._componentRef?.injector && this._formControl) {
-            this._formControlDirective.valueAccessor = this._componentRef.injector.get<ControlValueAccessor[]>(NG_VALUE_ACCESSOR, null)?.find((_: ControlValueAccessor): true => true);
+            const valueAccessors: ControlValueAccessor[] | null = this._componentRef.injector.get<ControlValueAccessor[] | null>(NG_VALUE_ACCESSOR, null);
+            
+            this._formControlDirective.valueAccessor = Array.isArray(valueAccessors) && valueAccessors.length > 0 ? valueAccessors[0] : null;
             this._formControlDirective.form = this._formControl;
 
             // A callback method that is invoked immediately after the default change detector has checked data-bound properties if at least one has changed, and before the view and content children are checked.
@@ -411,12 +424,18 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         if (this.configuration()?.attributes && Object.keys(this.configuration().attributes).length > 0 && this._componentRef?.location?.nativeElement) {
             for (const attributeName in this.configuration().attributes) {
                 // Evaluates JavaScript code and executes it.
-                const value = this.evaluateExpression(this.configuration().attributes[attributeName], this.viewModel) as string;
+                const value = this.evaluateExpression(this.configuration().attributes[attributeName], this.viewModel);
+                // Convert non-string values to their string form; null/undefined mean "remove the attribute".
+                const stringValue: string | null = value != null ? String(value) : null;
 
                 // Returns element's first attribute whose qualified name is qualifiedName, and null if there is no such attribute otherwise.
-                if (value !== this._componentRef.location.nativeElement.getAttribute(attributeName)) {
+                if (stringValue !== this._componentRef.location.nativeElement.getAttribute(attributeName)) {
                     // Implement this callback to set an attribute value for an element in the DOM.
-                    this._renderer.setAttribute(this._componentRef.location.nativeElement, attributeName, value);
+                    if (stringValue != null) {
+                        this._renderer.setAttribute(this._componentRef.location.nativeElement, attributeName, stringValue);
+                    } else {
+                        this._renderer.removeAttribute(this._componentRef.location.nativeElement, attributeName);
+                    }
                 }
             }
         }
@@ -431,7 +450,8 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      */
     private evaluateExpression(value: unknown, $vm?: ModelSignal<unknown>, $event?: unknown): unknown {
         if (typeof(value) === 'string' && ((value.includes('$vm') && $vm != null && $vm() != null) || (value.includes('$event') && $event != null))) {
-            // Evaluates JavaScript code and executes it.
+            // NOTE: This uses eval() by design to support expression binding via the $vm and $event placeholders.
+            // Only evaluate expressions from trusted configuration sources — arbitrary JavaScript can be executed here.
             return eval(value);
         } else {
             return value;
@@ -439,17 +459,53 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     }
 
     /**
+     * Cleans up every dynamically created resource: subscriptions, form control, value accessor directive and component reference.
+     * Used both on component type change and on destroy.
+     */
+    private cleanup(): void {
+        // Disposes the resources held by the output subscriptions.
+        this._outputsSubscriptions?.forEach((s: Subscription): void => s.unsubscribe());
+
+        this._outputsSubscriptions = [];
+
+        // Disposes the resources held by the form control subscription.
+        this._formControlSubscription?.unsubscribe();
+
+        this._formControlSubscription = undefined;
+
+        // Remove the managed control from the form group.
+        if (this._formControl && this.formGroup()) {
+            const attributeName = this.configuration()?.attributes?.['name'];
+
+            if (attributeName) {
+                const controlName = this.evaluateExpression(attributeName, this.viewModel) as string;
+
+                // Only remove the control if it is the one this component created, so that
+                // a pre-existing control registered under the same name is left untouched.
+                if (typeof controlName === 'string' && this.formGroup().get(controlName) === this._formControl) {
+                    this.formGroup().removeControl(controlName);
+                }
+            }
+        }
+
+        this._formControl = undefined;
+        this._managedValidatorFns = [];
+
+        // A callback method that performs custom clean-up, invoked immediately before a directive, pipe, or service instance is destroyed.
+        this._formControlDirective?.ngOnDestroy();
+
+        this._formControlDirective = undefined;
+
+        // Destroys the component instance and all of the data structures associated with it.
+        this._componentRef?.destroy();
+        
+        this._componentRef = undefined;
+    }
+
+    /**
      * A callback method that performs custom clean-up, invoked immediately before a directive, pipe, or service instance is destroyed.
      */
 	ngOnDestroy(): void {
-        // Performs the specified action for each element in an array (Disposes the resources held by the subscription).
-        this._outputsSubscriptions?.forEach((s: Subscription): void => s.unsubscribe());
-        // Disposes the resources held by the subscription.
-        // May, for instance, cancel an ongoing Observable execution or cancel any other type of work that started when the Subscription was created.
-        this._formControlSubscription?.unsubscribe();
-        // A callback method that performs custom clean-up, invoked immediately before a directive, pipe, or service instance is destroyed.
-        this._formControlDirective?.ngOnDestroy();
-        // Destroys the component instance and all of the data structures associated with it.
-        this._componentRef?.destroy();
+        this.cleanup();
 	}
 }
