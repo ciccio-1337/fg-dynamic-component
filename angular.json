@@ -23,6 +23,15 @@
             }
           },
           "defaultConfiguration": "production"
+        },
+        "test": {
+          "builder": "@angular/build:unit-test",
+          "options": {
+            "buildTarget": "fg-dynamic-component:build",
+            "runner": "vitest",
+            "tsConfig": "projects/fg-dynamic-component/tsconfig.spec.json",
+            "setupFiles": ["projects/fg-dynamic-component/src/test-setup.ts"]
+          }
         }
       }
     }
