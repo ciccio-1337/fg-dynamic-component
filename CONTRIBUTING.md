@@ -19,11 +19,11 @@ Here are some resources to help you get started with open source contributions:
 
 If you spot a problem in this project, [search if an issue already exists](https://docs.github.com/en/github/searching-for-information-on-github/searching-on-github/searching-issues-and-pull-requests#search-by-the-title-body-or-comments).
 
-If a related issue doesn't exist, you can open a new issue using a relevant [issue form](https://github.com/ciccio-90/fg-dynamic-component/issues/new/choose).
+If a related issue doesn't exist, you can open a new issue using a relevant [issue form](https://github.com/ciccio-1337/fg-dynamic-component/issues/new/choose).
 
 ### Solve an issue
 
-Scan through our [existing issues](https://github.com/ciccio-90/fg-dynamic-component/issues) to find one that interests you.
+Scan through our [existing issues](https://github.com/ciccio-1337/fg-dynamic-component/issues) to find one that interests you.
 You can narrow down the search using `labels` as filters.
 See [Labels](https://github.com/github/docs/blob/main/contributing/how-to-use-labels.md) for more information.
 As a general rule, we don’t assign issues to anyone but it has an assignee - it's already being worked on by someone else so you should probably skip it.
