@@ -1,6 +1,7 @@
-import { Component, EventEmitter, Input, Output, signal } from '@angular/core';
+import { Component, EventEmitter, Input, Output, forwardRef, output, signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { AbstractControl, FormGroup, ReactiveFormsModule } from '@angular/forms';
+import { By } from '@angular/platform-browser';
+import { AbstractControl, ControlValueAccessor, FormControl, FormGroup, NG_VALUE_ACCESSOR, ReactiveFormsModule } from '@angular/forms';
 import { FGDynamicComponent, FGDynamicService, IFGDynamicItem } from './fg-dynamic.component';
 
 @Component({
@@ -38,6 +39,90 @@ class TestWithOutputsComponent {
   template: '<div><ng-content></ng-content></div>'
 })
 class TestWithNgContentComponent {}
+
+@Component({
+  selector: 'test-alternate',
+  standalone: true,
+  template: '<div>alternate</div>'
+})
+class TestAlternateComponent {}
+
+@Component({
+  selector: 'test-signal-output',
+  standalone: true,
+  template: '<button (click)="click()">signal-click</button>'
+})
+class TestSignalOutputComponent {
+  readonly clicked = output<string>();
+
+  click(): void {
+    this.clicked.emit('signal-hello');
+  }
+}
+
+@Component({
+  selector: 'test-void-output',
+  standalone: true,
+  template: '<button (click)="click()">void-click</button>'
+})
+class TestVoidOutputComponent {
+  @Output() done = new EventEmitter<void>();
+
+  click(): void {
+    this.done.emit();
+  }
+}
+
+@Component({
+  selector: 'test-cva',
+  standalone: true,
+  template: '<input [value]="value" (input)="handleInput($event)" />',
+  providers: [{
+    provide: NG_VALUE_ACCESSOR,
+    useExisting: forwardRef(() => TestCvaComponent),
+    multi: true
+  }]
+})
+class TestCvaComponent implements ControlValueAccessor {
+  value = '';
+  private _onChange: (value: string) => void = () => {};
+  private _onTouched: () => void = () => {};
+
+  writeValue(value: unknown): void {
+    this.value = value == null ? '' : String(value);
+  }
+
+  registerOnChange(fn: (value: string) => void): void {
+    this._onChange = fn;
+  }
+
+  registerOnTouched(fn: () => void): void {
+    this._onTouched = fn;
+  }
+
+  setDisabledState(isDisabled: boolean): void {
+    // No-op for the test value accessor.
+  }
+
+  handleInput(event: Event): void {
+    const value = (event.target as HTMLInputElement).value;
+    this.value = value;
+    this._onChange(value);
+    this._onTouched();
+  }
+}
+
+class TestMarker {
+  constructor(public readonly label: string) {}
+}
+
+async function settle(fixture: ComponentFixture<unknown>): Promise<void> {
+  for (let index = 0; index < 3; index++) {
+    fixture.detectChanges();
+    await fixture.whenStable();
+  }
+  fixture.detectChanges();
+}
 
 describe('FGDynamicService', () => {
   beforeEach(() => {
@@ -486,5 +571,523 @@ describe('FGDynamicComponent', () => {
     expect(control).toBeTruthy();
     control.setValue('abc');
     expect(control.hasError('pattern')).toBe(true);
+  });
+
+  it('should support dotted form control names through nested groups', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { data: { firstName: 'Jhon' } });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'data.firstName' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const nested = formGroup.get('data');
+    expect(nested).toBeInstanceOf(FormGroup);
+    const control = formGroup.get('data.firstName') as unknown as FormControl;
+    expect(control).toBeInstanceOf(FormControl);
+    expect(control.value).toBe('Jhon');
+
+    control.setValue('Jane');
+    await settle(fixture);
+    expect((component.viewModel() as any).data.firstName).toBe('Jane');
+
+    fixture.destroy();
+    expect(formGroup.get('data.firstName')).toBeNull();
+    expect(formGroup.get('data')).toBeNull();
+  });
+
+  it('should not remove a pre-existing dotted control on cleanup', async () => {
+    const firstName = new FormControl('pre-existing');
+    const data = new FormGroup({ firstName });
+    const formGroup = new FormGroup({ data });
+
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { data: { firstName: 'pre-existing' } });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'data.firstName' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(formGroup.get('data.firstName')).toBe(firstName);
+    fixture.destroy();
+    expect(formGroup.get('data.firstName')).toBe(firstName);
+    expect(firstName.value).toBe('pre-existing');
+  });
+
+  it('should subscribe to valueChanges on reused controls', async () => {
+    const existing = new FormControl('initial');
+    const formGroup = new FormGroup({ name: existing });
+
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { name: 'initial' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    existing.setValue('updated');
+    await settle(fixture);
+
+    expect(formGroup.get('name')).toBe(existing);
+    expect((component.viewModel() as any).name).toBe('updated');
+  });
+
+  it('should restore the disabled state of a reused control', async () => {
+    const existing = new FormControl({ value: 'pre', disabled: true });
+    const formGroup = new FormGroup({ name: existing });
+
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { name: 'pre' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name', disabled: false }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(existing.disabled).toBe(false);
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(existing.disabled).toBe(true);
+  });
+
+  it('should rewire the form control when its name changes', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { first: 'one', second: 'two' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'first' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(formGroup.get('first')).toBeInstanceOf(FormControl);
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'second' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(formGroup.get('first')).toBeNull();
+    expect((formGroup.get('second') as unknown as FormControl).value).toBe('two');
+  });
+
+  it('should rewire the form control when the form group changes', async () => {
+    const firstGroup = new FormGroup({});
+    const secondGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', firstGroup);
+    fixture.componentRef.setInput('viewModel', { name: 'value' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(firstGroup.get('name')).toBeInstanceOf(FormControl);
+
+    fixture.componentRef.setInput('formGroup', secondGroup);
+    await settle(fixture);
+
+    expect(firstGroup.get('name')).toBeNull();
+    expect(secondGroup.get('name')).toBeInstanceOf(FormControl);
+  });
+
+  it('should wire the form control when form inputs become available later', async () => {
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { name: 'later' });
+    await settle(fixture);
+
+    const control = formGroup.get('name') as unknown as FormControl;
+    expect(control).toBeInstanceOf(FormControl);
+    expect(control.value).toBe('later');
+  });
+
+  it('should synchronize a ControlValueAccessor with the form control', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { name: 'initial' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const control = formGroup.get('name') as unknown as FormControl;
+    expect(control).toBeInstanceOf(FormControl);
+    expect(control.value).toBe('initial');
+
+    const input: HTMLInputElement | null = fixture.nativeElement.querySelector('test-cva input');
+    expect(input).toBeTruthy();
+    expect(input!.value).toBe('initial');
+
+    const cva = fixture.debugElement.query(By.directive(TestCvaComponent)).componentInstance as TestCvaComponent;
+
+    input!.value = 'typed';
+    input!.dispatchEvent(new Event('input'));
+    await settle(fixture);
+
+    expect(control.value).toBe('typed');
+    expect(cva.value).toBe('typed');
+    expect((component.viewModel() as any).name).toBe('typed');
+
+    control.setValue('programmatic');
+    await settle(fixture);
+    expect(cva.value).toBe('programmatic');
+    expect((component.viewModel() as any).name).toBe('programmatic');
+  });
+
+  it('should preserve functions and non-plain objects when updating the view model', async () => {
+    const handler = vi.fn();
+    const marker = new TestMarker('keep');
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', {
+      name: 'before',
+      handler,
+      marker,
+      nested: { keep: true }
+    });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    (formGroup.get('name') as unknown as FormControl).setValue('after');
+    await settle(fixture);
+
+    const updated = component.viewModel() as any;
+    expect(updated.name).toBe('after');
+    expect(updated.handler).toBe(handler);
+    expect(updated.marker).toBe(marker);
+    expect(updated.nested.keep).toBe(true);
+  });
+
+  it('should clear the rendered component when the type is removed', async () => {
+    fixture.componentRef.setInput('configuration', { type: TestSimpleComponent } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).toContain('simple');
+
+    fixture.componentRef.setInput('configuration', {} as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).not.toContain('simple');
+  });
+
+  it('should clear the rendered component when the registry name is unknown', async () => {
+    fixture.componentRef.setInput('configuration', { type: TestSimpleComponent } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).toContain('simple');
+
+    fixture.componentRef.setInput('configuration', { type: 'MissingComponent' } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).not.toContain('simple');
+  });
+
+  it('should clear the rendered component when a loader throws', async () => {
+    fixture.componentRef.setInput('configuration', { type: TestSimpleComponent } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).toContain('simple');
+
+    fixture.componentRef.setInput('configuration', {
+      type: () => {
+        throw new Error('loader failed');
+      }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).not.toContain('simple');
+  });
+
+  it('should ignore a late async resolution for a superseded configuration', async () => {
+    let resolveLate!: (value: typeof TestAlternateComponent) => void;
+    const late = new Promise<typeof TestAlternateComponent>((resolve) => {
+      resolveLate = resolve;
+    });
+
+    fixture.componentRef.setInput('configuration', { type: late } as IFGDynamicItem);
+    fixture.detectChanges();
+
+    fixture.componentRef.setInput('configuration', { type: TestSimpleComponent } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).toContain('simple');
+
+    resolveLate(TestAlternateComponent);
+    await settle(fixture);
+
+    expect(fixture.nativeElement.textContent).toContain('simple');
+    expect(fixture.nativeElement.textContent).not.toContain('alternate');
+  });
+
+  it('should support signal outputs created with output()', async () => {
+    const viewModel: any = {};
+    fixture.componentRef.setInput('viewModel', viewModel);
+    fixture.componentRef.setInput('configuration', {
+      type: TestSignalOutputComponent,
+      outputs: {
+        clicked: function (event: unknown): void {
+          this.received = event;
+        }
+      }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const button: HTMLButtonElement | null = fixture.nativeElement.querySelector('button');
+    expect(button).toBeTruthy();
+    button!.click();
+    await settle(fixture);
+
+    expect(viewModel.received).toBe('signal-hello');
+  });
+
+  it('should evaluate output expressions for nullish/void event payloads', async () => {
+    const done = vi.fn();
+    fixture.componentRef.setInput('viewModel', { done });
+    fixture.componentRef.setInput('configuration', {
+      type: TestVoidOutputComponent,
+      outputs: { done: '$vm().done($event)' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const button: HTMLButtonElement | null = fixture.nativeElement.querySelector('button');
+    expect(button).toBeTruthy();
+    button!.click();
+    await settle(fixture);
+
+    expect(done).toHaveBeenCalledTimes(1);
+    expect(done).toHaveBeenCalledWith(undefined);
+  });
+
+  it('should treat boolean attributes as presence/absence', async () => {
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { hidden: false, required: false, checked: false }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const host: HTMLElement = fixture.nativeElement.querySelector('test-simple');
+    expect(host).toBeTruthy();
+    expect(host.hasAttribute('hidden')).toBe(false);
+    expect(host.hasAttribute('required')).toBe(false);
+    expect(host.hasAttribute('checked')).toBe(false);
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { hidden: true, required: true, checked: true }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(host.hasAttribute('hidden')).toBe(true);
+    expect(host.hasAttribute('required')).toBe(true);
+    expect(host.hasAttribute('checked')).toBe(true);
+  });
+
+  it('should evaluate boolean attributes from the view model', async () => {
+    fixture.componentRef.setInput('viewModel', { hidden: false });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { hidden: '$vm().hidden' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const host: HTMLElement = fixture.nativeElement.querySelector('test-simple');
+    expect(host.hasAttribute('hidden')).toBe(false);
+
+    fixture.componentRef.setInput('viewModel', { hidden: true });
+    await settle(fixture);
+    expect(host.hasAttribute('hidden')).toBe(true);
+  });
+
+  it('should remove attributes whose keys are deleted from the configuration', async () => {
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { id: 'test-id', title: 'title', 'data-extra': 'extra' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const host: HTMLElement = fixture.nativeElement.querySelector('test-simple');
+    expect(host.getAttribute('id')).toBe('test-id');
+    expect(host.getAttribute('title')).toBe('title');
+    expect(host.getAttribute('data-extra')).toBe('extra');
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { id: 'test-id' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(host.getAttribute('id')).toBe('test-id');
+    expect(host.getAttribute('title')).toBeNull();
+    expect(host.getAttribute('data-extra')).toBeNull();
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(host.getAttribute('id')).toBeNull();
+  });
+
+  it('should re-enable a control when the disabled key is deleted', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { name: 'test' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name', disabled: true }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect((formGroup.get('name') as unknown as FormControl).disabled).toBe(true);
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect((formGroup.get('name') as unknown as FormControl).disabled).toBe(false);
+  });
+
+  it('should normalize numeric and string disabled values', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { name: 'test' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name', disabled: 1 }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect((formGroup.get('name') as unknown as FormControl).disabled).toBe(true);
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name', disabled: 0 }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect((formGroup.get('name') as unknown as FormControl).disabled).toBe(false);
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name', disabled: 'true' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect((formGroup.get('name') as unknown as FormControl).disabled).toBe(true);
+  });
+
+  it('should reset inputs whose keys are deleted from the configuration', async () => {
+    fixture.componentRef.setInput('configuration', {
+      type: TestWithInputsComponent,
+      inputs: { value: 'set', count: 5 }
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).toContain('set-5');
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestWithInputsComponent,
+      inputs: {}
+    } as IFGDynamicItem);
+    await settle(fixture);
+    expect(fixture.nativeElement.textContent).not.toContain('set-5');
+  });
+
+  it('should fall back to the literal value when the view model is missing', async () => {
+    fixture.componentRef.setInput('configuration', {
+      type: TestWithInputsComponent,
+      inputs: { value: '$vm().name' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(fixture.nativeElement.textContent).toContain('$vm().name');
+
+    expect((component as any).evaluateExpression('$vm().name', undefined)).toBe('$vm().name');
+    expect((component as any).evaluateExpression('$event', undefined, undefined, true)).toBeUndefined();
+    expect((component as any).evaluateExpression('$event', undefined, 1, false)).toBe('$event');
+  });
+
+  it('should expose ModelSignal helpers on $vm', () => {
+    fixture.componentRef.setInput('viewModel', { count: 1 });
+
+    (component as any).evaluateExpression(
+      '$vm.update(current => ({ ...current, count: current.count + 1 }))',
+      { count: 1 }
+    );
+
+    expect((component.viewModel() as any).count).toBe(2);
+  });
+
+  it('should reject overlapping alternation patterns', async () => {
+    for (const pattern of ['(a|aa)+$', '(\\w|\\d)+$']) {
+      const formGroup = new FormGroup({});
+      fixture.componentRef.setInput('formGroup', formGroup);
+      fixture.componentRef.setInput('viewModel', { name: '' });
+      fixture.componentRef.setInput('configuration', {
+        type: TestSimpleComponent,
+        attributes: { name: 'name', pattern }
+      } as IFGDynamicItem);
+      await settle(fixture);
+
+      const control = formGroup.get('name') as unknown as FormControl;
+      control.setValue('a'.repeat(1000) + '!');
+      expect(control.hasError('pattern')).toBe(false);
+    }
+  });
+
+  it('should clone global/sticky regex validators without stateful flags', async () => {
+    const formGroup = new FormGroup({});
+    const pattern = /a/g;
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('viewModel', { name: '' });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { name: 'name', pattern }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const control = formGroup.get('name') as unknown as FormControl;
+    control.setValue('a');
+    expect(control.hasError('pattern')).toBe(false);
+    control.setValue('a');
+    expect(control.hasError('pattern')).toBe(false);
+    control.setValue('b');
+    expect(control.hasError('pattern')).toBe(true);
+  });
+
+  it('should preserve numeric-key objects when setting model paths', () => {
+    const model: any = { a: { 0: { x: 1 } } };
+    (component as any).setModelPropertyValue(model, 'a.0.y', 2);
+
+    expect(model.a[0].x).toBe(1);
+    expect(model.a[0].y).toBe(2);
+  });
+
+  it('should reject malformed bracket paths', () => {
+    const parsePath = (component as any).parsePath.bind(component);
+
+    expect(parsePath('a[0')).toBeNull();
+    expect(parsePath('a.b[')).toBeNull();
+    expect(parsePath('a..b')).toBeNull();
+    expect(parsePath('a[]')).toBeNull();
+    expect(parsePath('a[0].b')).toEqual(['a', '0', 'b']);
+    expect(parsePath("a['b.c']")).toEqual(['a', 'b.c']);
+  });
+
+  it('should project nested items into the content slot', async () => {
+    fixture.componentRef.setInput('configuration', {
+      type: TestWithNgContentComponent,
+      items: [{ type: TestSimpleComponent }]
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const host: HTMLElement = fixture.nativeElement.querySelector('test-with-ngcontent');
+    expect(host).toBeTruthy();
+    expect(host.querySelector('test-simple')).toBeTruthy();
   });
 });

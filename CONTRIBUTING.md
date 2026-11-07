@@ -40,7 +40,7 @@ There are 2 ways to do that:
 1. Use [Github Codespaces](https://docs.github.com/en/codespaces) to make changes directly online where everything is preconfigured (Recommended)
 2. Using docker you can boot a dev container and connect to it from VSCode using [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) which will have everything ready
 3. Manually install required dependencies on your local device:
-   - Install NodeJS v18+
+   - Install NodeJS v26+
    - Install NPM v10+
 
 ### Steps to make changes

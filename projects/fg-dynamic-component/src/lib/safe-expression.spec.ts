@@ -66,4 +66,20 @@ describe('evaluateSafeExpression', () => {
   it('should reject expressions nested too deeply', () => {
     expect(() => evaluateSafeExpression(`${'('.repeat(100)}1${')'.repeat(100)}`, {})).toThrow(FGDynamicExpressionError);
   });
+
+  it('should enforce parse depth for arrays, objects and calls', () => {
+    expect(() => evaluateSafeExpression(`${'['.repeat(200)}1${']'.repeat(200)}`, {})).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression(`${'({ a: '.repeat(100)}1${' })'.repeat(100)}`, {})).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression(`${'f('.repeat(200)}${')'.repeat(200)}`, { f: () => 1 })).toThrow(FGDynamicExpressionError);
+  });
+
+  it('should enforce parse depth for unary and exponent chains', () => {
+    expect(() => evaluateSafeExpression(`${'!'.repeat(200)}true`, {})).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression(`${'2 ** '.repeat(200)}1`, {})).toThrow(FGDynamicExpressionError);
+  });
+
+  it('should support optional calls', () => {
+    expect(evaluateSafeExpression('$vm.missing?.()', { $vm: {} })).toBeUndefined();
+    expect(evaluateSafeExpression('$vm.run?.()', { $vm: { run: () => 'ran' } })).toBe('ran');
+  });
 });

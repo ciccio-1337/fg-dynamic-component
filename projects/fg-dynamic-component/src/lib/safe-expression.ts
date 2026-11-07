@@ -460,8 +460,13 @@ class ExpressionParser {
     private parseExponent(): Node {
         const left = this.parseUnary();
         if (this.matchPunctuator('**')) {
-            const right = this.parseExponent();
-            return { type: 'Binary', operator: '**', left, right };
+            this.enter();
+            try {
+                const right = this.parseExponent();
+                return { type: 'Binary', operator: '**', left, right };
+            } finally {
+                this.leave();
+            }
         }
         return left;
     }
@@ -472,13 +477,23 @@ class ExpressionParser {
             isPunctuator(this.current(), '-') ||
             isPunctuator(this.current(), '+')
         ) {
-            const operator = this.advance().value;
-            return { type: 'Unary', operator, argument: this.parseUnary() };
+            this.enter();
+            try {
+                const operator = this.advance().value;
+                return { type: 'Unary', operator, argument: this.parseUnary() };
+            } finally {
+                this.leave();
+            }
         }
 
         if (isIdentifier(this.current(), 'typeof')) {
-            this.advance();
-            return { type: 'Unary', operator: 'typeof', argument: this.parseUnary() };
+            this.enter();
+            try {
+                this.advance();
+                return { type: 'Unary', operator: 'typeof', argument: this.parseUnary() };
+            } finally {
+                this.leave();
+            }
         }
 
         return this.parsePostfix();
@@ -545,20 +560,25 @@ class ExpressionParser {
     }
 
     private parseArguments(): ArgumentNode[] {
-        const args: ArgumentNode[] = [];
+        this.enter();
+        try {
+            const args: ArgumentNode[] = [];
 
-        if (!isPunctuator(this.current(), ')')) {
-            do {
-                if (isPunctuator(this.current(), ')')) {
-                    break;
-                }
-                const spread = this.matchPunctuator('...');
-                args.push({ spread, value: this.parseAssignment() });
-            } while (this.matchPunctuator(','));
+            if (!isPunctuator(this.current(), ')')) {
+                do {
+                    if (isPunctuator(this.current(), ')')) {
+                        break;
+                    }
+                    const spread = this.matchPunctuator('...');
+                    args.push({ spread, value: this.parseAssignment() });
+                } while (this.matchPunctuator(','));
+            }
+
+            this.expectPunctuator(')');
+            return args;
+        } finally {
+            this.leave();
         }
-
-        this.expectPunctuator(')');
-        return args;
     }
 
     private parsePrimary(): Node {
@@ -605,62 +625,72 @@ class ExpressionParser {
     }
 
     private parseArray(): Node {
-        const elements: ArgumentNode[] = [];
+        this.enter();
+        try {
+            const elements: ArgumentNode[] = [];
 
-        if (!isPunctuator(this.current(), ']')) {
-            do {
-                if (isPunctuator(this.current(), ']')) {
-                    break;
-                }
-                const spread = this.matchPunctuator('...');
-                elements.push({ spread, value: this.parseAssignment() });
-            } while (this.matchPunctuator(','));
+            if (!isPunctuator(this.current(), ']')) {
+                do {
+                    if (isPunctuator(this.current(), ']')) {
+                        break;
+                    }
+                    const spread = this.matchPunctuator('...');
+                    elements.push({ spread, value: this.parseAssignment() });
+                } while (this.matchPunctuator(','));
+            }
+
+            this.expectPunctuator(']');
+            return { type: 'Array', elements };
+        } finally {
+            this.leave();
         }
-
-        this.expectPunctuator(']');
-        return { type: 'Array', elements };
     }
 
     private parseObject(): Node {
-        const properties: ObjectProperty[] = [];
+        this.enter();
+        try {
+            const properties: ObjectProperty[] = [];
 
-        if (!isPunctuator(this.current(), '}')) {
-            do {
-                if (isPunctuator(this.current(), '}')) {
-                    break;
-                }
-
-                if (this.matchPunctuator('...')) {
-                    properties.push({ spread: true, value: this.parseAssignment(), computed: false });
-                    continue;
-                }
-
-                let key: Node;
-                let computed = false;
-
-                if (this.matchPunctuator('[')) {
-                    key = this.parseExpression();
-                    this.expectPunctuator(']');
-                    computed = true;
-                } else {
-                    const keyToken = this.advance();
-                    if (keyToken.type === 'identifier' || keyToken.type === 'string') {
-                        key = { type: 'Literal', value: keyToken.value };
-                    } else if (keyToken.type === 'number') {
-                        key = { type: 'Literal', value: String(Number(keyToken.value)) };
-                    } else {
-                        return fail('Invalid object key.');
+            if (!isPunctuator(this.current(), '}')) {
+                do {
+                    if (isPunctuator(this.current(), '}')) {
+                        break;
                     }
-                }
 
-                this.expectPunctuator(':');
-                const value = this.parseAssignment();
-                properties.push({ spread: false, key, value, computed });
-            } while (this.matchPunctuator(','));
+                    if (this.matchPunctuator('...')) {
+                        properties.push({ spread: true, value: this.parseAssignment(), computed: false });
+                        continue;
+                    }
+
+                    let key: Node;
+                    let computed = false;
+
+                    if (this.matchPunctuator('[')) {
+                        key = this.parseExpression();
+                        this.expectPunctuator(']');
+                        computed = true;
+                    } else {
+                        const keyToken = this.advance();
+                        if (keyToken.type === 'identifier' || keyToken.type === 'string') {
+                            key = { type: 'Literal', value: keyToken.value };
+                        } else if (keyToken.type === 'number') {
+                            key = { type: 'Literal', value: String(Number(keyToken.value)) };
+                        } else {
+                            return fail('Invalid object key.');
+                        }
+                    }
+
+                    this.expectPunctuator(':');
+                    const value = this.parseAssignment();
+                    properties.push({ spread: false, key, value, computed });
+                } while (this.matchPunctuator(','));
+            }
+
+            this.expectPunctuator('}');
+            return { type: 'Object', properties };
+        } finally {
+            this.leave();
         }
-
-        this.expectPunctuator('}');
-        return { type: 'Object', properties };
     }
 }
 
@@ -835,7 +865,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                         if (typeof argument !== 'number' && typeof argument !== 'bigint') {
                             return fail('Unary "-" only supports numbers.');
                         }
-                        return typeof argument === 'bigint' ? -argument : -argument;
+                        return -argument;
                     case '+':
                         if (typeof argument !== 'number') {
                             return fail('Unary "+" only supports numbers.');

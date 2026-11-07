@@ -191,6 +191,11 @@ class MyDynamicComponent1 {
 You can update your inputs passing expressions binding using a view model and they will trigger standard Angular's life-cycle hooks
 (of course you should consider which change detection strategy you are using).
 
+Both classic `@Output() EventEmitter` and signal outputs created with
+`output()` are supported. Output handlers receive `$event`; handlers are also
+invoked when an output emits `null`/`undefined` (for example an
+`EventEmitter<void>`).
+
 ```ts
 @Component({
   selector: 'my-component',
@@ -262,6 +267,12 @@ class MyComponent {
 > and non-primitive values are ignored. `href` and `src` only accept `http`,
 > `https`, `mailto`, `tel` and relative URLs, so `javascript:` URLs are blocked
 > even when they come from an expression.
+>
+> Boolean attributes (`hidden`, `disabled`, `readonly`, `required`, `checked`,
+> `selected`, `multiple`) follow HTML presence semantics: a truthy value adds
+> the attribute, while `false`/`null`/`undefined` removes it (it is never
+> written as `hidden="false"`). Attributes deleted from the configuration, or
+> whose value becomes `null`, are removed from the element.
 
 ### Reactive Forms
 
@@ -309,6 +320,13 @@ class MyComponent {
 > Control names are interpreted as dot/bracket paths into the view model. Paths that
 > contain `__proto__`, `prototype` or `constructor` are rejected, so a configuration
 > cannot pollute object prototypes or register such names in a `FormGroup`.
+>
+> Dotted names such as `data.firstName` are wired through nested `FormGroup`s, so
+> `formGroup.get('data.firstName')` works and no `FormGroup` key contains a dot.
+> Pre-existing controls are reused (including their `valueChanges` sync) and are
+> never removed when the dynamic component is destroyed; only controls created by
+> this component are cleaned up. Changing the form group or the evaluated control
+> name rebinds the control automatically.
 
 ## Security
 
@@ -342,6 +360,10 @@ A value that contains neither `$vm` nor `$event` is used as a plain literal.
 
 - Attribute names/values are validated (see [Attributes](#attributes)) and URL
   schemes are checked.
+- `pattern` validators are size-limited, reject nested/ambiguous quantifiers and
+  quantified alternations (e.g. `(a+)+`, `(a|aa)+`), and clone `RegExp` values
+  without `g`/`y` so validation is not stateful. The ReDoS check is a conservative
+  heuristic, not a full regular-expression analyzer.
 - The component registry uses a `Map` and never resolves inherited properties
   (`constructor`, `__proto__`, …). Prefer a scoped registry for untrusted
   configurations.
