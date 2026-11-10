@@ -7,6 +7,7 @@ Create an Angular standalone signals based dynamic components tree through a JSO
 
 | Angular | fg-dynamic-component | NPM package                   |
 | ------- | -------------------- | ----------------------------- |
+| 22.2.3  | 4.0.0                | `fg-dynamic-component@^4.0.0` |
 | 22.2.3  | 3.0.0                | `fg-dynamic-component@^3.0.0` |
 | 22.1.6  | 2.0.0                | `fg-dynamic-component@^2.0.0` |
 | 17.2.4  | 1.1.1                | `fg-dynamic-component@^1.1.1` |
@@ -136,7 +137,7 @@ registry.register("MyDynamicComponent1", MyDynamicComponent1);
 
 @Component({
     selector: "my-component",
-    template: `<fg-dynamic [configuration]="configuration()" [registry]="registry" />`,
+    template: `<fg-dynamic [configuration]="configuration()" [registry]="registry" [typePolicy]="{ requireScopedRegistry: true }" />`,
     imports: [FGDynamicComponent],
     standalone: true
 })
@@ -148,7 +149,9 @@ class MyComponent {
 
 A configuration can only resolve component names that were explicitly registered in
 the registry it receives. Names such as `constructor`, `__proto__` or `toString` are
-never resolved from the registry prototype chain.
+never resolved from the registry prototype chain. For untrusted configurations,
+`[typePolicy]="{ requireScopedRegistry: true }"` makes the component refuse to fall
+back to the global registry.
 
 ### Inputs and Outputs
 
@@ -199,7 +202,7 @@ invoked when an output emits `null`/`undefined` (for example an
 ```ts
 @Component({
   selector: 'my-component',
-  template: `<fg-dynamic [configuration]="configuration()" [(viewModel)]="viewModel" />`,
+  template: `<fg-dynamic [configuration]="configuration()" [(viewModel)]="viewModel" [expressionPolicy]="{ allowedMethods: ['handleSomething'] }" />`,
   imports: [FGDynamicComponent],
   standalone: true
 })
@@ -323,10 +326,13 @@ class MyComponent {
 >
 > Dotted names such as `data.firstName` are wired through nested `FormGroup`s, so
 > `formGroup.get('data.firstName')` works and no `FormGroup` key contains a dot.
-> Pre-existing controls are reused (including their `valueChanges` sync) and are
-> never removed when the dynamic component is destroyed; only controls created by
-> this component are cleaned up. Changing the form group or the evaluated control
-> name rebinds the control automatically.
+> By default the component never reuses pre-existing controls or nested groups:
+> a bind to an existing control is ignored unless
+> `[formControlPolicy]="{ allowExistingControls: true }"` is set. Controls created
+> by this component are removed on destroy; reused controls are left intact.
+> Use `[formControlPolicy]="{ allowedControlNames: ['data.firstName'] }"` to
+> restrict which control names a configuration may bind. Changing the form group
+> or the evaluated control name rebinds the control automatically.
 
 ## Security
 
@@ -338,32 +344,69 @@ other string-to-code primitive is used. The supported subset is:
 
 - literals (`'text'`, `42`, `true`, `false`, `null`, `undefined`), arrays and objects;
 - member access `$vm().name`, `$vm()['name']` and optional chaining `$vm().a?.b`;
-- calls such as `$vm().save($event)` and expression-bodied arrow functions
-  (for example `$vm().items.map(item => item.id)`);
+- calls to native built-ins (`$vm().items.map(...)`, `.filter(...)`, `.join(...)`,
+  string methods such as `.slice(...)`/`.trim(...)`) and expression-bodied arrow
+  functions;
 - unary, arithmetic, comparison, logical, nullish and ternary operators;
 - array/object spread and arrow functions whose body returns an expression or
   contains a `return` statement.
 
 Anything else is ignored at runtime (a warning is printed only in development mode).
-In particular globals (`window`, `fetch`, …), assignments, `new`, `this`, template
-literals, regular-expression literals and access to `__proto__`, `prototype`,
-`constructor`, `caller`, `callee` or `arguments` are rejected. Expressions are also
-limited in size, token count, nesting depth and evaluation steps.
+In particular globals (`window`, `fetch`, …), DOM host objects (`$event`,
+`$event.target`, `document`, `localStorage`, `location`, …), assignments, `new`,
+`this`, template literals, regular-expression literals and access to `__proto__`,
+`prototype`, `constructor`, `caller`, `callee`, `arguments`, `call`, `apply` or
+`bind` are rejected. Expressions are also limited in size, token count, nesting
+depth and evaluation steps.
 
 A value that contains neither `$vm` nor `$event` is used as a plain literal.
 
-> Expressions are configuration data, not sandboxed user code: a trusted
-> configuration can still call methods that exist on the view model. Only load
-> configurations from sources you trust.
+#### Expression policy (read-only by default)
+
+Expressions are a capability boundary, not ordinary sandboxed user code. Custom
+methods reachable from the view model are rejected by default; allow only the
+methods a configuration actually needs:
+
+```ts
+template: `<fg-dynamic [configuration]="configuration()" [expressionPolicy]="{ allowedMethods: ['save'] }" />`
+// Or, only for configurations you fully trust:
+template: `<fg-dynamic [configuration]="configuration()" [expressionPolicy]="{ allowCustomMethods: true }" />`
+```
+
+`$vm()` remains available and returns the view model. `$vm.set` and `$vm.update`
+are not exposed by default; enable view-model mutation explicitly with
+`[expressionPolicy]="{ allowViewModelMutation: true }"`.
+
+> Treat configurations as untrusted data unless they come from your own code.
+> For multi-tenant/plugin scenarios prefer a scoped registry,
+> `expressionPolicy.allowedMethods`, `formControlPolicy.allowedControlNames`,
+> `[typePolicy]="{ requireScopedRegistry: true }"` and
+> `[attributePolicy]="{ strict: true }"`.
+
+#### Component type policy
+
+A direct `type` may be an Angular component class or a registry name. Promise and
+function loaders execute host code and are rejected by default; opt in with
+`[typePolicy]="{ allowFunctionTypes: true }"`. `requireScopedRegistry` prevents an
+untrusted configuration from falling back to the global registry.
 
 ### Other hardening
 
 - Attribute names/values are validated (see [Attributes](#attributes)) and URL
   schemes are checked.
+- `attributePolicy.strict` disables `id`, `class`, `for`, `href` and `src`
+  (`name` remains available because it also drives form wiring), which mitigates
+  DOM clobbering and UI-redress scenarios. Combine it with a Content Security
+  Policy for untrusted content.
 - `pattern` validators are size-limited, reject nested/ambiguous quantifiers and
-  quantified alternations (e.g. `(a+)+`, `(a|aa)+`), and clone `RegExp` values
-  without `g`/`y` so validation is not stateful. The ReDoS check is a conservative
-  heuristic, not a full regular-expression analyzer.
+  quantified alternations (e.g. `(a+)+`, `(\d+(?:\d+)?)+`, `(a|aa)+`), and clone
+  `RegExp` values without `g`/`y` so validation is not stateful. The ReDoS check is
+  a conservative heuristic, not a full regular-expression analyzer.
+- Configuration trees are limited in depth, total node count and
+  `inputs`/`outputs`/`attributes` key count/length. Repeated references and cycles
+  are rejected before rendering.
+- Native string builders (`repeat`, `padStart`, `padEnd`, `join`) are bounded to
+  avoid memory/CPU exhaustion.
 - The component registry uses a `Map` and never resolves inherited properties
   (`constructor`, `__proto__`, …). Prefer a scoped registry for untrusted
   configurations.

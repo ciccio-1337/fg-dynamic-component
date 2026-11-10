@@ -29,6 +29,8 @@ jobs:
         run: npm run test -- --no-watch
       - name: Build 🔧
         run: npm run build
+      # Prefer npm trusted publishing (OIDC): configure the package on npmjs.com
+      # and remove NODE_AUTH_TOKEN once enabled. The token remains as a fallback.
       - name: Publish package on NPM 📦
         run: cd dist/fg-dynamic-component && npm publish --access=public --provenance
         env:

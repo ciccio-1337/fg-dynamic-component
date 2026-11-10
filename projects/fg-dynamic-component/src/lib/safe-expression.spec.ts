@@ -27,7 +27,7 @@ describe('evaluateSafeExpression', () => {
     };
 
     expect(evaluateSafeExpression('$vm().items.map(item => item * 2).join(",")', variables)).toBe('2,4');
-    expect(evaluateSafeExpression('$vm().update($event)', variables)).toBeUndefined();
+    expect(evaluateSafeExpression('$vm().update($event)', variables, { allowedMethods: ['update'] })).toBeUndefined();
     expect(update).toHaveBeenCalledWith('payload');
   });
 
@@ -80,6 +80,64 @@ describe('evaluateSafeExpression', () => {
 
   it('should support optional calls', () => {
     expect(evaluateSafeExpression('$vm.missing?.()', { $vm: {} })).toBeUndefined();
-    expect(evaluateSafeExpression('$vm.run?.()', { $vm: { run: () => 'ran' } })).toBe('ran');
+    expect(evaluateSafeExpression('$vm.run?.()', { $vm: { run: () => 'ran' } }, { allowedMethods: ['run'] })).toBe('ran');
+  });
+
+  it('should reject DOM host objects and host-object results', () => {
+    const element = document.createElement('button');
+    const event = new MouseEvent('click');
+
+    expect(() => evaluateSafeExpression('$event.target', { $event: event })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$event.ownerDocument', { $event: element })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$event.defaultView', { $event: document })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$event', { $event: element })).toThrow(FGDynamicExpressionError);
+    // A plain wrapper that returns a host object must not become a stepping stone.
+    expect(() => evaluateSafeExpression('$event.target', { $event: { target: element } })).toThrow(FGDynamicExpressionError);
+  });
+
+  it('should require an allowlist for custom methods', () => {
+    const save = vi.fn();
+    const variables = { $vm: () => ({ save }) };
+
+    expect(() => evaluateSafeExpression('$vm().save(1)', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm().save(1)', variables, { allowedMethods: ['save'] })).not.toThrow();
+    expect(save).toHaveBeenCalledWith(1);
+    expect(() => evaluateSafeExpression('$vm().save(2)', variables, { allowCustomMethods: true })).not.toThrow();
+    expect(save).toHaveBeenCalledWith(2);
+  });
+
+  it('should block call/apply/bind and custom prototype methods', () => {
+    const variables = { $vm: () => ({ items: [1, 2], save: () => 'saved' }) };
+
+    expect(() => evaluateSafeExpression('$vm().save.call(null)', variables, { allowedMethods: ['save'] })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm().save.apply(null, [])', variables, { allowedMethods: ['save'] })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm().save.bind(null)', variables, { allowedMethods: ['save'] })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm().items.map.call(null, item => item)', variables)).toThrow(FGDynamicExpressionError);
+  });
+
+  it('should reject inherited properties and accessors on class instances', () => {
+    class Service {
+      save(): string {
+        return 'saved';
+      }
+
+      get secret(): string {
+        return 'secret';
+      }
+    }
+
+    const service = new Service();
+    const variables = { $vm: service };
+
+    expect(() => evaluateSafeExpression('$vm.secret', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm.save', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm.save()', variables, { allowCustomMethods: true })).not.toThrow();
+  });
+
+  it('should cap native string growth', () => {
+    expect(() => evaluateSafeExpression("'x'.repeat(100000000)", {})).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression("'x'.padStart(100000000)", {})).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression("'x'.repeat(100000)", {})).toThrow(FGDynamicExpressionError);
+    expect(evaluateSafeExpression("'x'.repeat(16)", {})).toBe('x'.repeat(16));
   });
 });

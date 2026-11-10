@@ -13,10 +13,59 @@ export interface IFGDynamicItem {
     items?: IFGDynamicItem[];
 }
 
+/**
+ * Controls what expressions may do. By default expressions are read-only and
+ * can only call native built-ins and `$vm()`; custom view-model methods and
+ * view-model mutation require an explicit opt-in.
+ */
+export interface IFGDynamicExpressionPolicy {
+    /** Allow calling any method reachable from the view model. Defaults to `false`. */
+    allowCustomMethods?: boolean;
+    /** Method names that may be called when `allowCustomMethods` is `false`. */
+    allowedMethods?: readonly string[];
+    /** Expose `$vm.set` and `$vm.update`. Defaults to `false`. */
+    allowViewModelMutation?: boolean;
+}
+
+/**
+ * Controls how the dynamic component interacts with the host `FormGroup`.
+ * By default pre-existing controls and nested groups are not reused.
+ */
+export interface IFGDynamicFormPolicy {
+    /** Reuse controls/groups that already exist in the supplied `FormGroup`. */
+    allowExistingControls?: boolean;
+    /** Optional allowlist of form control names (the evaluated `attributes.name`). */
+    allowedControlNames?: readonly string[];
+}
+
+/**
+ * Controls which component `type` values are accepted.
+ * Promise/loader values are rejected unless explicitly enabled.
+ */
+export interface IFGDynamicTypePolicy {
+    /** Allow promise-returning and function loader `type` values. Defaults to `false`. */
+    allowFunctionTypes?: boolean;
+    /** Require an explicit scoped registry instead of the global default. */
+    requireScopedRegistry?: boolean;
+}
+
+/**
+ * Controls which DOM attributes may be applied. `strict` is intended for
+ * untrusted configurations and disables UI-redress/DOM-clobbering attributes.
+ */
+export interface IFGDynamicAttributePolicy {
+    /** Disallow `id`, `class`, `for`, `href` and `src`. Defaults to `false`. */
+    strict?: boolean;
+}
+
 const FORBIDDEN_PATH_SEGMENTS: ReadonlySet<string> = new Set(['__proto__', 'prototype', 'constructor']);
 const MAX_PATH_DEPTH = 32;
 const MAX_PATH_SEGMENT_LENGTH = 128;
 const MAX_CONFIGURATION_ITEMS = 1000;
+const MAX_CONFIGURATION_DEPTH = 32;
+const MAX_TOTAL_CONFIGURATION_NODES = 2000;
+const MAX_CONFIGURATION_KEYS = 100;
+const MAX_CONFIGURATION_KEY_LENGTH = 128;
 const MAX_ATTRIBUTE_NAME_LENGTH = 128;
 const MAX_ATTRIBUTE_VALUE_LENGTH = 8192;
 const MAX_PATTERN_LENGTH = 512;
@@ -30,6 +79,9 @@ const ALLOWED_ATTRIBUTES: ReadonlySet<string> = new Set([
 ]);
 
 const URL_ATTRIBUTES: ReadonlySet<string> = new Set(['href', 'src']);
+
+/** Attributes disabled by `attributePolicy.strict` for untrusted configurations. */
+const STRICT_DISALLOWED_ATTRIBUTES: ReadonlySet<string> = new Set(['id', 'class', 'for', 'href', 'src']);
 
 /**
  * HTML boolean attributes: presence means `true`, so a false/absent value must
@@ -125,7 +177,7 @@ export class FGDynamicService {
 	template: `
         <ng-container #viewContainer></ng-container>
         @for (item of items(); track $index) {
-            <fg-dynamic #dynamicItem [configuration]="item" [(viewModel)]="viewModel" [formGroup]="formGroup()" [registry]="registry()" />
+            <fg-dynamic #dynamicItem [configuration]="item" [(viewModel)]="viewModel" [formGroup]="formGroup()" [registry]="registry()" [expressionPolicy]="expressionPolicy()" [formControlPolicy]="formControlPolicy()" [typePolicy]="typePolicy()" [attributePolicy]="attributePolicy()" [depth]="depth() + 1" />
         }
     `,
 	changeDetection: ChangeDetectionStrategy.OnPush,
@@ -137,13 +189,25 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 	viewModel: ModelSignal<unknown> = model<unknown>();
 	formGroup: InputSignal<FormGroup> = input<FormGroup>();
 	registry: InputSignal<FGDynamicRegistry> = input<FGDynamicRegistry>(FGDynamicService.registry);
+	expressionPolicy: InputSignal<IFGDynamicExpressionPolicy> = input<IFGDynamicExpressionPolicy>({});
+	formControlPolicy: InputSignal<IFGDynamicFormPolicy> = input<IFGDynamicFormPolicy>({});
+	typePolicy: InputSignal<IFGDynamicTypePolicy> = input<IFGDynamicTypePolicy>({});
+	attributePolicy: InputSignal<IFGDynamicAttributePolicy> = input<IFGDynamicAttributePolicy>({});
+	/** Current nesting depth; used to bound recursive configurations. */
+	depth: InputSignal<number> = input<number>(0);
 
     /**
      * Validated child items. Invalid entries are ignored and the list is capped
      * to avoid pathological configurations blocking the renderer.
      */
     protected readonly items: Signal<readonly IFGDynamicItem[]> = computed((): readonly IFGDynamicItem[] => {
+        if (this.depth() >= MAX_CONFIGURATION_DEPTH) {
+            return [];
+        }
         const configuration = this.configuration();
+        if (!this.validateConfiguration(configuration)) {
+            return [];
+        }
         const items = configuration && typeof configuration === 'object' && !Array.isArray(configuration) ? (configuration as IFGDynamicItem).items : undefined;
         if (!Array.isArray(items)) {
             return [];
@@ -203,6 +267,12 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             const configuration = this.configuration();
             if (configuration != null && (typeof configuration !== 'object' || Array.isArray(configuration))) {
                 this.logError('Invalid configuration: expected an object.');
+                this.clearResolvedComponent(counter);
+                return;
+            }
+
+            if (!this.validateConfiguration(configuration)) {
+                this.logError('Invalid configuration: it exceeds the structural limits.');
                 this.clearResolvedComponent(counter);
                 return;
             }
@@ -274,12 +344,100 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     }
 
     /**
+     * Validates the whole configuration subtree before rendering. Rejects
+     * excessive depth, node count, key counts, oversized keys and cycles.
+     * The check is iterative so a hostile configuration cannot overflow the
+     * JavaScript stack during validation itself.
+     */
+    private validateConfiguration(configuration: IFGDynamicItem | null | undefined): boolean {
+        if (configuration == null) {
+            return true;
+        }
+
+        const stats = this.collectConfigurationStats(configuration);
+        if (!stats) {
+            return false;
+        }
+
+        return this.depth() + stats.maxDepth <= MAX_CONFIGURATION_DEPTH
+            && stats.nodes <= MAX_TOTAL_CONFIGURATION_NODES;
+    }
+
+    private collectConfigurationStats(configuration: IFGDynamicItem): { nodes: number; maxDepth: number } | null {
+        const stack: Array<{ item: unknown; depth: number }> = [{ item: configuration, depth: 0 }];
+        const seen = new WeakSet<object>();
+        let nodes = 0;
+        let maxDepth = 0;
+
+        while (stack.length > 0) {
+            const current = stack.pop()!;
+            const item = current.item;
+
+            if (item == null || typeof item !== 'object' || Array.isArray(item)) {
+                return null;
+            }
+            if (seen.has(item)) {
+                // Reject cycles and repeated references to the same node.
+                return null;
+            }
+            seen.add(item);
+
+            nodes++;
+            if (nodes > MAX_TOTAL_CONFIGURATION_NODES || current.depth > MAX_CONFIGURATION_DEPTH) {
+                return null;
+            }
+            if (current.depth > maxDepth) {
+                maxDepth = current.depth;
+            }
+
+            for (const field of ['inputs', 'attributes', 'outputs'] as const) {
+                const map = (item as Record<string, unknown>)[field];
+                if (map == null) {
+                    continue;
+                }
+                if (typeof map !== 'object' || Array.isArray(map)) {
+                    return null;
+                }
+
+                const keys = Object.keys(map as Record<string, unknown>);
+                if (keys.length > MAX_CONFIGURATION_KEYS) {
+                    return null;
+                }
+                if (keys.some((key: string): boolean => key.length > MAX_CONFIGURATION_KEY_LENGTH
+                    || FORBIDDEN_PATH_SEGMENTS.has(key.toLowerCase()))) {
+                    return null;
+                }
+            }
+
+            const items = (item as Record<string, unknown>)['items'];
+            if (items == null) {
+                continue;
+            }
+            if (!Array.isArray(items) || items.length > MAX_CONFIGURATION_ITEMS) {
+                return null;
+            }
+
+            for (const child of items) {
+                stack.push({ item: child, depth: current.depth + 1 });
+            }
+        }
+
+        return { nodes, maxDepth };
+    }
+
+    /**
      * A method to lazy-load a component.
      */
     private async loadComponentAsync(counter: number): Promise<void> {
         const configurationType = this.configuration()?.type;
 
         if (configurationType == null) {
+            this.clearResolvedComponent(counter);
+            return;
+        }
+
+        if (this.typePolicy()?.requireScopedRegistry === true && this.isUsingGlobalRegistry()) {
+            this.logWarning('A scoped registry is required by typePolicy but only the global registry is available.');
             this.clearResolvedComponent(counter);
             return;
         }
@@ -295,6 +453,12 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             }
         } else {
             candidate = configurationType;
+        }
+
+        if (!this.isCandidateAllowed(candidate)) {
+            this.logWarning('Component type was rejected by typePolicy (function/promise types are disabled).');
+            this.clearResolvedComponent(counter);
+            return;
         }
 
         try {
@@ -384,6 +548,25 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             metadata['ngComponentDef'] ||
             metadata['ngDirectiveDef']
         );
+    }
+
+    /**
+     * Function loaders and thenables execute host code, so they are only
+     * accepted when the host opts in. Angular component classes stay allowed.
+     */
+    private isCandidateAllowed(candidate: unknown): boolean {
+        if (candidate == null) {
+            return false;
+        }
+        if (this.typePolicy()?.allowFunctionTypes === true) {
+            return true;
+        }
+        return typeof candidate === 'function' && this.isAngularComponentType(candidate);
+    }
+
+    private isUsingGlobalRegistry(): boolean {
+        const registry = this.registry();
+        return registry == null || registry === FGDynamicService.registry;
     }
 
     private getRegistry(): FGDynamicRegistry {
@@ -560,6 +743,12 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             return undefined;
         }
 
+        const allowedNames = this.formControlPolicy()?.allowedControlNames;
+        if (allowedNames !== undefined && (!Array.isArray(allowedNames) || !allowedNames.includes(name))) {
+            this.logWarning('Form control name was rejected by formControlPolicy.');
+            return undefined;
+        }
+
         return name;
     }
 
@@ -613,15 +802,24 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         const key = path[path.length - 1];
         const existing = parent.get(key);
 
-        if (existing instanceof FormControl) {
+        if (existing) {
+            if (this.formControlPolicy()?.allowExistingControls !== true) {
+                this.logWarning('A form control with the requested name already exists; reuse is disabled by formControlPolicy.');
+                this._wiredFormGroup = undefined;
+                this._wiredControlName = undefined;
+                return;
+            }
+
+            if (!(existing instanceof FormControl)) {
+                this.logWarning('A form control with the requested name already exists and is not a FormControl.');
+                this._wiredFormGroup = undefined;
+                this._wiredControlName = undefined;
+                return;
+            }
+
             this.logWarning('A form control with the requested name already exists; reusing it.');
             this._formControl = existing;
             this._ownsFormControl = false;
-        } else if (existing) {
-            this.logWarning('A form control with the requested name already exists and is not a FormControl.');
-            this._wiredFormGroup = undefined;
-            this._wiredControlName = undefined;
-            return;
         } else {
             // Construct a FormControl with an initial value.
             const control = new FormControl(this.getModelPropertyValue(this.getViewModelValue(), name, null));
@@ -669,6 +867,10 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 this._createdFormGroups.push({ parent: current, key: segment, group });
                 current = group;
             } else if (existing instanceof FormGroup) {
+                if (this.formControlPolicy()?.allowExistingControls !== true) {
+                    this.logWarning(`Cannot reuse existing nested form group "${segment}" because formControlPolicy disables it.`);
+                    return null;
+                }
                 current = existing;
             } else {
                 this.logWarning(`Cannot create nested form group "${segment}" because a different control already exists.`);
@@ -1004,34 +1206,138 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     }
 
     /**
-     * Heuristic check for regular expressions with nested/ambiguous quantifiers
-     * (e.g. `(a+)+`, `(a*)*`, `(\d+){2,}`) and quantified alternations
-     * (e.g. `(a|aa)+`, `(\w|\d)+`) that can cause exponential backtracking.
+     * Conservative scanner for regular expressions with nested/ambiguous
+     * quantifiers (e.g. `(a+)+`, `(\d+(?:\d+)?)+`, `(a*)*`, `(\d+){2,}`) and
+     * quantified alternations (e.g. `(a|aa)+`, `(\w|\d)+`) that can cause
+     * exponential backtracking.
      *
-     * This is intentionally conservative and is only a heuristic: it rejects a
-     * broader class of ambiguous constructs than a full ReDoS analyzer would.
+     * Groups are tracked with an explicit stack, so nested groups and optional
+     * inner quantifiers are detected instead of relying on a single regex.
+     * This is still a heuristic: it errs on the side of rejecting ambiguous
+     * constructs rather than allowing a catastrophic pattern through.
      */
     private isUnsafeRegex(source: string): boolean {
         if (source.length > MAX_PATTERN_LENGTH) {
             return true;
         }
-        if (/\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)(?:[+*]|\{\d)/.test(source)) {
-            return true;
+
+        interface GroupState {
+            hasQuantifier: boolean;
+            hasAlternation: boolean;
         }
-        if (/\((?:[^()\\]|\\.)*(?:\{\d+(?:,\d*)?\})(?:[^()\\]|\\.)*\)(?:[+*]|\{\d)/.test(source)) {
+
+        const stack: GroupState[] = [{ hasQuantifier: false, hasAlternation: false }];
+        let inCharacterClass = false;
+
+        const isQuantifierAt = (index: number): boolean => {
+            const character = source[index];
+            if (character === '+' || character === '*') {
+                return true;
+            }
+            if (character !== '{') {
+                return false;
+            }
+            const match = /^\{\d+(?:,\d*)?\}/.exec(source.slice(index));
+            if (!match) {
+                return false;
+            }
+            // Very large bounded repetitions are also a CPU/memory hazard.
+            const bounds = /^\{(\d+)(?:,(\d*))?\}/.exec(match[0]);
+            if (bounds) {
+                const upper = bounds[2] === undefined || bounds[2] === '' ? Infinity : Number(bounds[2]);
+                if (Number.isFinite(upper) && upper > 10000) {
+                    return true;
+                }
+            }
             return true;
+        };
+
+        for (let index = 0; index < source.length; index++) {
+            const character = source[index];
+
+            if (character === '\\') {
+                const next = source[index + 1];
+                if (next && /[1-9]/.test(next)) {
+                    let cursor = index + 2;
+                    while (cursor < source.length && /\d/.test(source[cursor])) {
+                        cursor++;
+                    }
+                    if (isQuantifierAt(cursor)) {
+                        return true;
+                    }
+                }
+                index++;
+                continue;
+            }
+
+            if (inCharacterClass) {
+                if (character === ']') {
+                    inCharacterClass = false;
+                }
+                continue;
+            }
+
+            if (character === '[') {
+                inCharacterClass = true;
+                continue;
+            }
+
+            if (character === '(') {
+                stack.push({ hasQuantifier: false, hasAlternation: false });
+                // Skip the `?` of `(?:`, `(?=`, `(?!`, `(?<=`, `(?<!` and
+                // named capture group prefixes.
+                if (source[index + 1] === '?') {
+                    index++;
+                }
+                continue;
+            }
+
+            if (character === ')') {
+                const group = stack.pop();
+                if (group) {
+                    const quantified = isQuantifierAt(index + 1);
+                    if (quantified && (group.hasQuantifier || group.hasAlternation)) {
+                        return true;
+                    }
+
+                    const parent = stack[stack.length - 1];
+                    if (parent) {
+                        if (quantified || group.hasQuantifier) {
+                            parent.hasQuantifier = true;
+                        }
+                        if (group.hasAlternation) {
+                            parent.hasAlternation = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (character === '|') {
+                stack[stack.length - 1].hasAlternation = true;
+                continue;
+            }
+
+            if (character === '+' || character === '*' || character === '{' || character === '?') {
+                // `?` is a quantifier when it follows a token, but not when it
+                // belongs to a group prefix (`(?:`, `(?=`, …).
+                if (character === '?' && source[index - 1] === '(') {
+                    continue;
+                }
+                if (character === '{' && !/^\{\d+(?:,\d*)?\}/.test(source.slice(index))) {
+                    continue;
+                }
+                if (character === '{' && isQuantifierAt(index)) {
+                    const bounds = /^\{(\d+)(?:,(\d*))?\}/.exec(source.slice(index));
+                    const upper = bounds && bounds[2] !== undefined && bounds[2] !== '' ? Number(bounds[2]) : Infinity;
+                    if (Number.isFinite(upper) && upper > 10000) {
+                        return true;
+                    }
+                }
+                stack[stack.length - 1].hasQuantifier = true;
+            }
         }
-        // Any quantified group containing an alternation is ambiguous enough to
-        // risk overlapping alternatives such as `(a|aa)+` or `(\w|\d)+`.
-        if (/\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*(?:[+*]|\{\d)/.test(source)) {
-            return true;
-        }
-        if (/\\[1-9][+*{]/.test(source)) {
-            return true;
-        }
-        if (/\((?:\.\*|\.\+)[^)]*\)[+*{]/.test(source)) {
-            return true;
-        }
+
         return false;
     }
 
@@ -1219,6 +1525,22 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     }
 
     /**
+     * Only plain objects and arrays may be traversed/written by form
+     * synchronization. This prevents writes into class instances, services and
+     * DOM objects referenced by the view model.
+     */
+    private isMutableContainer(value: unknown): boolean {
+        if (value == null || typeof value !== 'object') {
+            return false;
+        }
+        if (Array.isArray(value)) {
+            return true;
+        }
+        const prototype = Object.getPrototypeOf(value);
+        return prototype === Object.prototype || prototype === null;
+    }
+
+    /**
      * Gets the value at path of object. If the resolved value is undefined, the defaultValue is returned in its place.
      * Only own properties are read; prototype-chain reads are blocked.
      * @param model The object.
@@ -1281,7 +1603,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 const key = pathArray[index];
                 const isLast = index === pathArray.length - 1;
 
-                if (current == null || (typeof current !== 'object' && typeof current !== 'function')) {
+                if (!this.isMutableContainer(current)) {
                     return;
                 }
 
@@ -1465,6 +1787,10 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             return false;
         }
 
+        if (this.attributePolicy()?.strict === true && STRICT_DISALLOWED_ATTRIBUTES.has(lower)) {
+            return false;
+        }
+
         if (lower.startsWith('data-') || lower.startsWith('aria-')) {
             return true;
         }
@@ -1588,20 +1914,31 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         }
 
         try {
-            // Expose the view model as a callable (`$vm()`) while preserving the
-            // ModelSignal methods (`$vm.set(...)`, `$vm.update(...)`).
+            const policy = this.expressionPolicy() ?? {};
+            const allowedMethods = new Set<string>(Array.isArray(policy.allowedMethods) ? policy.allowedMethods : []);
+
+            // Expose the view model as a callable (`$vm()`). The ModelSignal
+            // helpers are only attached when the host opts into mutation.
             const $vm: any = (): unknown => this.getViewModelValue();
-            $vm.set = (nextValue: unknown): void => {
-                this.viewModel.set(nextValue);
-            };
-            $vm.update = (updateFn: (current: unknown) => unknown): void => {
-                this.viewModel.update(updateFn);
-            };
+
+            if (policy.allowViewModelMutation === true) {
+                $vm.set = (nextValue: unknown): void => {
+                    this.viewModel.set(nextValue);
+                };
+                $vm.update = (updateFn: (current: unknown) => unknown): void => {
+                    this.viewModel.update(updateFn);
+                };
+                allowedMethods.add('set');
+                allowedMethods.add('update');
+            }
 
             return evaluateSafeExpression(value, {
                 $vm,
                 $event: eventParam,
                 $ev: eventParam
+            }, {
+                allowCustomMethods: policy.allowCustomMethods === true,
+                allowedMethods: Array.from(allowedMethods)
             });
         } catch {
             this.logWarning('Expression could not be evaluated safely and was ignored.');

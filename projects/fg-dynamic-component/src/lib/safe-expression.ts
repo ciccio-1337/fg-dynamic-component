@@ -17,6 +17,11 @@
  * Assignments, `new`, `this`, globals (e.g. `window`, `fetch`), template
  * literals and regular-expression literals are rejected. Prototype-related
  * property names are blocked at every access.
+ *
+ * Expressions are also treated as a capability boundary: browser host objects
+ * (DOM nodes, events, `window`, `document`, storage, …) are never readable and
+ * methods can only be invoked through an allowlist. This prevents an expression
+ * from escaping through `$event`/`$vm` values that happen to reference the DOM.
  */
 
 const MAX_SOURCE_LENGTH = 2000;
@@ -24,6 +29,23 @@ const MAX_TOKENS = 4000;
 const MAX_PARSE_DEPTH = 80;
 const MAX_EVALUATION_STEPS = 20000;
 const MAX_EVALUATION_DEPTH = 80;
+const MAX_STRING_LENGTH = 100000;
+const MAX_REPEAT_COUNT = 10000;
+
+/**
+ * Public policy for expression evaluation.
+ *
+ * By default expressions are read-only and can only call native built-ins
+ * (`Array.prototype.map`, `String.prototype.slice`, …) plus the callable `$vm`
+ * wrapper. Custom view-model methods and `$vm.set`/`$vm.update` must be enabled
+ * explicitly by the host application.
+ */
+export interface FGDynamicExpressionOptions {
+    /** Allow calling any method found on a view-model value. Defaults to `false`. */
+    allowCustomMethods?: boolean;
+    /** Method names that may be called even when `allowCustomMethods` is false. */
+    allowedMethods?: readonly string[];
+}
 
 const FORBIDDEN_PROPERTIES: ReadonlySet<string> = new Set([
     '__proto__',
@@ -35,8 +57,243 @@ const FORBIDDEN_PROPERTIES: ReadonlySet<string> = new Set([
     '__defineGetter__',
     '__defineSetter__',
     '__lookupGetter__',
-    '__lookupSetter__'
+    '__lookupSetter__',
+    // Function capabilities that can defeat the method policy.
+    'call',
+    'apply',
+    'bind',
+    // Browser globals and DOM escape hatches.
+    'window',
+    'self',
+    'globalThis',
+    'global',
+    'top',
+    'parent',
+    'frames',
+    'opener',
+    'document',
+    'ownerDocument',
+    'defaultView',
+    'contentWindow',
+    'contentDocument',
+    'location',
+    'cookie',
+    'localStorage',
+    'sessionStorage',
+    'indexedDB',
+    'navigator',
+    'history',
+    'screen',
+    'fetch',
+    'XMLHttpRequest',
+    'WebSocket',
+    'Worker',
+    'importScripts',
+    'postMessage',
+    'sendBeacon',
+    'setTimeout',
+    'setInterval',
+    'setImmediate',
+    'requestAnimationFrame',
+    'open',
+    'close',
+    'write',
+    'writeln',
+    'innerHTML',
+    'outerHTML',
+    'insertAdjacentHTML',
+    'eval',
+    'Function'
 ]);
+
+/**
+ * Built-in methods that are safe to invoke from an expression. Identity checks
+ * are used instead of name checks, so an attacker cannot shadow `map` with a
+ * custom function and have it accepted.
+ */
+const SAFE_NATIVE_METHODS: ReadonlySet<Function> = new Set<Function>([
+    Array.prototype.at,
+    Array.prototype.concat,
+    Array.prototype.entries,
+    Array.prototype.every,
+    Array.prototype.filter,
+    Array.prototype.find,
+    Array.prototype.findIndex,
+    Array.prototype.flat,
+    Array.prototype.flatMap,
+    Array.prototype.forEach,
+    Array.prototype.includes,
+    Array.prototype.indexOf,
+    Array.prototype.join,
+    Array.prototype.keys,
+    Array.prototype.lastIndexOf,
+    Array.prototype.map,
+    Array.prototype.reduce,
+    Array.prototype.reduceRight,
+    Array.prototype.slice,
+    Array.prototype.some,
+    Array.prototype.toLocaleString,
+    Array.prototype.toString,
+    Array.prototype.values,
+    String.prototype.at,
+    String.prototype.charAt,
+    String.prototype.charCodeAt,
+    String.prototype.codePointAt,
+    String.prototype.concat,
+    String.prototype.endsWith,
+    String.prototype.includes,
+    String.prototype.indexOf,
+    String.prototype.lastIndexOf,
+    String.prototype.localeCompare,
+    String.prototype.normalize,
+    String.prototype.padEnd,
+    String.prototype.padStart,
+    String.prototype.repeat,
+    String.prototype.replace,
+    String.prototype.replaceAll,
+    String.prototype.slice,
+    String.prototype.split,
+    String.prototype.startsWith,
+    String.prototype.substring,
+    String.prototype.substr,
+    String.prototype.toLocaleLowerCase,
+    String.prototype.toLocaleUpperCase,
+    String.prototype.toLowerCase,
+    String.prototype.toString,
+    String.prototype.toUpperCase,
+    String.prototype.trim,
+    String.prototype.trimEnd,
+    String.prototype.trimStart,
+    String.prototype.valueOf,
+    Number.prototype.toExponential,
+    Number.prototype.toFixed,
+    Number.prototype.toLocaleString,
+    Number.prototype.toPrecision,
+    Number.prototype.toString,
+    Number.prototype.valueOf,
+    Boolean.prototype.toString,
+    Boolean.prototype.valueOf,
+    BigInt.prototype.toString,
+    BigInt.prototype.valueOf,
+    Date.prototype.getDate,
+    Date.prototype.getDay,
+    Date.prototype.getFullYear,
+    Date.prototype.getHours,
+    Date.prototype.getMilliseconds,
+    Date.prototype.getMinutes,
+    Date.prototype.getMonth,
+    Date.prototype.getSeconds,
+    Date.prototype.getTime,
+    Date.prototype.getUTCDate,
+    Date.prototype.getUTCFullYear,
+    Date.prototype.toISOString,
+    Date.prototype.toJSON,
+    Date.prototype.toLocaleDateString,
+    Date.prototype.toLocaleString,
+    Date.prototype.toLocaleTimeString,
+    Date.prototype.toString,
+    Date.prototype.valueOf,
+    Object.prototype.hasOwnProperty,
+    Object.prototype.isPrototypeOf,
+    Object.prototype.propertyIsEnumerable,
+    Object.prototype.toLocaleString,
+    Object.prototype.toString,
+    Object.prototype.valueOf
+]);
+
+const INTERPRETER_FUNCTIONS = new WeakSet<Function>();
+
+const HOST_OBJECT_TAGS: ReadonlySet<string> = new Set([
+    'Window',
+    'global',
+    'globalThis',
+    'Document',
+    'HTMLDocument',
+    'XMLDocument',
+    'DocumentFragment',
+    'DocumentType',
+    'Node',
+    'NodeList',
+    'HTMLCollection',
+    'NamedNodeMap',
+    'Element',
+    'Event',
+    'EventTarget',
+    'CustomEvent',
+    'MouseEvent',
+    'KeyboardEvent',
+    'PointerEvent',
+    'FocusEvent',
+    'InputEvent',
+    'Storage',
+    'Location',
+    'History',
+    'Navigator',
+    'Screen',
+    'XMLHttpRequest',
+    'WebSocket',
+    'Worker',
+    'MessagePort',
+    'MessageChannel',
+    'File',
+    'FileList',
+    'FileReader',
+    'Blob',
+    'FormData',
+    'URL',
+    'URLSearchParams',
+    'MutationObserver',
+    'IntersectionObserver',
+    'ResizeObserver',
+    'Performance'
+]);
+
+function isHostObject(value: unknown): boolean {
+    if (value == null || (typeof value !== 'object' && typeof value !== 'function')) {
+        return false;
+    }
+
+    if (value === globalThis) {
+        return true;
+    }
+
+    try {
+        const tag = Object.prototype.toString.call(value).slice(8, -1);
+
+        if (HOST_OBJECT_TAGS.has(tag)) {
+            return true;
+        }
+
+        // DOM element/event subclasses use tagged names such as
+        // `HTMLButtonElement` or `PointerEvent`.
+        if (/(?:Element|Event|Document|Node|Observer|Collection|List|Map)$/.test(tag)
+            && tag !== 'Map'
+            && tag !== 'WeakMap'
+            && tag !== 'Set'
+            && tag !== 'WeakSet') {
+            return true;
+        }
+    } catch {
+        return true;
+    }
+
+    return false;
+}
+
+function isNativeFunction(value: unknown): value is Function {
+    return typeof value === 'function' && SAFE_NATIVE_METHODS.has(value);
+}
+
+function isInterpreterFunction(value: unknown): value is Function {
+    return typeof value === 'function' && INTERPRETER_FUNCTIONS.has(value);
+}
+
+function assertSafeValue(value: unknown): unknown {
+    if (isHostObject(value)) {
+        fail('Access to host objects is not allowed.');
+    }
+    return value;
+}
 
 const PUNCTUATORS: readonly string[] = [
     '===', '!==', '**', '==', '!=', '<=', '>=', '&&', '||', '??', '?.', '...', '=>',
@@ -700,6 +957,13 @@ function assertSafeProperty(property: string): void {
     }
 }
 
+function isMethodAllowed(name: string, options?: FGDynamicExpressionOptions): boolean {
+    if (options?.allowCustomMethods === true) {
+        return true;
+    }
+    return Array.isArray(options?.allowedMethods) && options!.allowedMethods!.includes(name);
+}
+
 function defineSafeProperty(target: Record<string, unknown>, key: string, value: unknown): void {
     assertSafeProperty(key);
     Object.defineProperty(target, key, {
@@ -710,7 +974,7 @@ function defineSafeProperty(target: Record<string, unknown>, key: string, value:
     });
 }
 
-function readMember(target: unknown, key: unknown, optional: boolean): unknown {
+function readMember(target: unknown, key: unknown, optional: boolean, options?: FGDynamicExpressionOptions): unknown {
     if (typeof key !== 'string' && typeof key !== 'number') {
         fail('Property keys must be strings or numbers.');
     }
@@ -725,7 +989,51 @@ function readMember(target: unknown, key: unknown, optional: boolean): unknown {
         fail('Cannot read properties of null or undefined.');
     }
 
-    return (Object(target) as Record<string, unknown>)[property];
+    // Reject DOM/browser host objects before any property access or getter runs.
+    if (isHostObject(target)) {
+        fail('Access to host objects is not allowed.');
+    }
+
+    const object = Object(target) as Record<string, unknown>;
+    const descriptor = Object.getOwnPropertyDescriptor(object, property);
+
+    if (descriptor) {
+        if (!('value' in descriptor)) {
+            // Accessor properties can execute arbitrary code.
+            fail('Access to accessor properties is not allowed.');
+        }
+        const value = descriptor.value;
+        if (typeof value === 'function'
+            && !isNativeFunction(value)
+            && !isInterpreterFunction(value)
+            && !isMethodAllowed(property, options)) {
+            fail('Access to custom methods is not allowed.');
+        }
+        return assertSafeValue(value);
+    }
+
+    // Inherited properties are only readable for explicitly safe methods, so
+    // class instances cannot leak services through their prototype chain.
+    let prototype = Object.getPrototypeOf(object);
+    while (prototype) {
+        const inheritedDescriptor = Object.getOwnPropertyDescriptor(prototype, property);
+        if (inheritedDescriptor) {
+            if (!('value' in inheritedDescriptor)) {
+                fail('Access to inherited accessor properties is not allowed.');
+            }
+            const inherited = inheritedDescriptor.value;
+            if (typeof inherited === 'function') {
+                if (isNativeFunction(inherited) || isInterpreterFunction(inherited) || isMethodAllowed(property, options)) {
+                    return inherited;
+                }
+                fail('Access to custom methods is not allowed.');
+            }
+            fail('Access to inherited properties is not allowed.');
+        }
+        prototype = Object.getPrototypeOf(prototype);
+    }
+
+    return undefined;
 }
 
 function spreadValues(value: unknown): unknown[] {
@@ -733,6 +1041,9 @@ function spreadValues(value: unknown): unknown[] {
         return value.slice();
     }
     if (typeof value === 'string') {
+        if (value.length > MAX_STRING_LENGTH) {
+            fail('Spread value is too large.');
+        }
         return value.split('');
     }
     return fail('Spread is only supported for arrays and strings.');
@@ -786,7 +1097,7 @@ function compareValues(operator: string, left: unknown, right: unknown): boolean
     }
 }
 
-function evaluateNode(node: Node, environment: Map<string, unknown>, state: EvaluationState): unknown {
+function evaluateNode(node: Node, environment: Map<string, unknown>, state: EvaluationState, options?: FGDynamicExpressionOptions): unknown {
     state.steps++;
     state.depth++;
 
@@ -808,26 +1119,28 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 if (!environment.has(node.name)) {
                     return fail(`Unknown identifier "${node.name}".`);
                 }
-                return environment.get(node.name);
+                return assertSafeValue(environment.get(node.name));
             }
 
             case 'Member': {
-                const object = evaluateNode(node.object, environment, state);
-                const key = evaluateNode(node.property, environment, state);
-                return readMember(object, key, node.optional);
+                const object = evaluateNode(node.object, environment, state, options);
+                const key = evaluateNode(node.property, environment, state, options);
+                return readMember(object, key, node.optional, options);
             }
 
             case 'Call': {
                 let fn: unknown;
                 let thisArg: unknown;
+                let methodName: string | undefined;
 
                 if (node.callee.type === 'Member') {
-                    const object = evaluateNode(node.callee.object, environment, state);
-                    const key = evaluateNode(node.callee.property, environment, state);
-                    fn = readMember(object, key, node.callee.optional);
+                    const object = evaluateNode(node.callee.object, environment, state, options);
+                    const key = evaluateNode(node.callee.property, environment, state, options);
+                    fn = readMember(object, key, node.callee.optional, options);
                     thisArg = object;
+                    methodName = String(key);
                 } else {
-                    fn = evaluateNode(node.callee, environment, state);
+                    fn = evaluateNode(node.callee, environment, state, options);
                 }
 
                 if (fn == null && node.optional) {
@@ -843,9 +1156,25 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                     return fail('Calling global constructors is not allowed.');
                 }
 
+                // Direct calls (`$vm()`, interpreter arrows) use host-provided
+                // capabilities. Member calls must be native built-ins,
+                // interpreter-created arrows, or explicitly allowed methods.
+                if (node.callee.type === 'Member') {
+                    if (!isNativeFunction(fn)
+                        && !isInterpreterFunction(fn)
+                        && !isMethodAllowed(methodName ?? '', options)) {
+                        return fail('Calling custom methods is not allowed.');
+                    }
+                } else {
+                    const isVmCall = node.callee.type === 'Identifier' && node.callee.name === '$vm';
+                    if (!isVmCall && !isInterpreterFunction(fn) && !isMethodAllowed('', options)) {
+                        return fail('Calling custom functions is not allowed.');
+                    }
+                }
+
                 const args: unknown[] = [];
                 for (const argument of node.args) {
-                    const value = evaluateNode(argument.value, environment, state);
+                    const value = evaluateNode(argument.value, environment, state, options);
                     if (argument.spread) {
                         args.push(...spreadValues(value));
                     } else {
@@ -853,11 +1182,36 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                     }
                 }
 
-                return (fn as (...args: unknown[]) => unknown).apply(thisArg, args);
+                // Bound native string builders before they allocate.
+                if (fn === String.prototype.repeat) {
+                    const count = args[0];
+                    const source = String(thisArg ?? '');
+                    if (typeof count !== 'number' || !Number.isFinite(count) || count < 0
+                        || count > MAX_REPEAT_COUNT || source.length * count > MAX_STRING_LENGTH) {
+                        return fail('String repetition is too large.');
+                    }
+                }
+                if ((fn === String.prototype.padStart || fn === String.prototype.padEnd)) {
+                    const targetLength = args[0];
+                    if (typeof targetLength === 'number' && targetLength > MAX_STRING_LENGTH) {
+                        return fail('String padding is too large.');
+                    }
+                }
+                if (fn === Array.prototype.join && Array.isArray(thisArg) && thisArg.length > MAX_STRING_LENGTH) {
+                    return fail('Array join is too large.');
+                }
+
+                const result = (fn as (...args: unknown[]) => unknown).apply(thisArg, args);
+
+                if (typeof result === 'string' && result.length > MAX_STRING_LENGTH) {
+                    return fail('Expression result is too large.');
+                }
+
+                return assertSafeValue(result);
             }
 
             case 'Unary': {
-                const argument = evaluateNode(node.argument, environment, state);
+                const argument = evaluateNode(node.argument, environment, state, options);
                 switch (node.operator) {
                     case '!': return !argument;
                     case 'typeof': return typeof argument;
@@ -877,8 +1231,8 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
             }
 
             case 'Binary': {
-                const left = evaluateNode(node.left, environment, state);
-                const right = evaluateNode(node.right, environment, state);
+                const left = evaluateNode(node.left, environment, state, options);
+                const right = evaluateNode(node.right, environment, state, options);
 
                 switch (node.operator) {
                     case '===': return left === right;
@@ -903,24 +1257,24 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
             }
 
             case 'Logical': {
-                const left = evaluateNode(node.left, environment, state);
+                const left = evaluateNode(node.left, environment, state, options);
                 switch (node.operator) {
-                    case '&&': return left ? evaluateNode(node.right, environment, state) : left;
-                    case '||': return left ? left : evaluateNode(node.right, environment, state);
-                    case '??': return left == null ? evaluateNode(node.right, environment, state) : left;
+                    case '&&': return left ? evaluateNode(node.right, environment, state, options) : left;
+                    case '||': return left ? left : evaluateNode(node.right, environment, state, options);
+                    case '??': return left == null ? evaluateNode(node.right, environment, state, options) : left;
                     default: return fail(`Unsupported logical operator "${node.operator}".`);
                 }
             }
 
             case 'Conditional':
-                return evaluateNode(node.test, environment, state)
-                    ? evaluateNode(node.consequent, environment, state)
-                    : evaluateNode(node.alternate, environment, state);
+                return evaluateNode(node.test, environment, state, options)
+                    ? evaluateNode(node.consequent, environment, state, options)
+                    : evaluateNode(node.alternate, environment, state, options);
 
             case 'Array': {
                 const values: unknown[] = [];
                 for (const element of node.elements) {
-                    const value = evaluateNode(element.value, environment, state);
+                    const value = evaluateNode(element.value, environment, state, options);
                     if (element.spread) {
                         values.push(...spreadValues(value));
                     } else {
@@ -934,7 +1288,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 const result: Record<string, unknown> = {};
                 for (const property of node.properties) {
                     if (property.spread) {
-                        const source = evaluateNode(property.value, environment, state);
+                        const source = evaluateNode(property.value, environment, state, options);
                         if (source == null || typeof source !== 'object') {
                             return fail('Object spread is only supported for objects.');
                         }
@@ -952,14 +1306,14 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                     }
 
                     const key = property.computed
-                        ? evaluateNode(property.key, environment, state)
+                        ? evaluateNode(property.key, environment, state, options)
                         : (property.key as { type: 'Literal'; value: unknown }).value;
 
                     if (typeof key !== 'string' && typeof key !== 'number') {
                         return fail('Object keys must be strings or numbers.');
                     }
 
-                    defineSafeProperty(result, String(key), evaluateNode(property.value, environment, state));
+                    defineSafeProperty(result, String(key), evaluateNode(property.value, environment, state, options));
                 }
                 return result;
             }
@@ -969,13 +1323,16 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 const body = node.body;
                 const closure = new Map(environment);
 
-                return function evaluateArrowFunction(...args: unknown[]): unknown {
+                const arrowFunction = function evaluateArrowFunction(...args: unknown[]): unknown {
                     const local = new Map(closure);
                     params.forEach((parameter: string, index: number): void => {
                         local.set(parameter, args[index]);
                     });
-                    return evaluateNode(body, local, state);
+                    return evaluateNode(body, local, state, options);
                 };
+
+                INTERPRETER_FUNCTIONS.add(arrowFunction);
+                return arrowFunction;
             }
 
             default:
@@ -992,8 +1349,15 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
  * Only the identifiers provided in `variables` are visible. Any unsupported
  * construct throws an `FGDynamicExpressionError`; callers should treat that as
  * an invalid expression and fall back to the literal value.
+ *
+ * `options` controls whether custom view-model methods may be invoked. Native
+ * built-ins are always available; host objects are never accessible.
  */
-export function evaluateSafeExpression(source: string, variables: Record<string, unknown> = {}): unknown {
+export function evaluateSafeExpression(
+    source: string,
+    variables: Record<string, unknown> = {},
+    options?: FGDynamicExpressionOptions
+): unknown {
     if (typeof source !== 'string') {
         fail('Expression must be a string.');
     }
@@ -1012,5 +1376,5 @@ export function evaluateSafeExpression(source: string, variables: Record<string,
         environment.set(key, value);
     }
 
-    return evaluateNode(ast, environment, { steps: 0, depth: 0 });
+    return assertSafeValue(evaluateNode(ast, environment, { steps: 0, depth: 0 }, options));
 }
