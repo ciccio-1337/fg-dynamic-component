@@ -140,4 +140,47 @@ describe('evaluateSafeExpression', () => {
     expect(() => evaluateSafeExpression("'x'.repeat(100000)", {})).toThrow(FGDynamicExpressionError);
     expect(evaluateSafeExpression("'x'.repeat(16)", {})).toBe('x'.repeat(16));
   });
+
+  it('should short-circuit multi-link optional chains', () => {
+    const variables = { $vm: {} as Record<string, unknown> };
+
+    expect(evaluateSafeExpression('$vm.missing?.label.length ?? "fallback"', variables)).toBe('fallback');
+    expect(evaluateSafeExpression('$vm.missing?.items.map(item => item) ?? "fallback"', variables)).toBe('fallback');
+    expect(evaluateSafeExpression('$vm.missing?.fn()', variables)).toBeUndefined();
+    expect(evaluateSafeExpression('$vm.missing?.fn?.()', variables)).toBeUndefined();
+    expect(evaluateSafeExpression('$vm.a?.b.c', variables)).toBeUndefined();
+  });
+
+  it('should keep normal errors when a non-optional link follows a present value', () => {
+    expect(() => evaluateSafeExpression('$vm.a?.b.c', { $vm: { a: { b: null } } })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm.a.b', { $vm: { a: null } })).toThrow(FGDynamicExpressionError);
+  });
+
+  it('should reject string amplification before allocating', () => {
+    expect(() => evaluateSafeExpression('"x".repeat(10000).replaceAll("", "y".repeat(10000))', {})).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('"x".repeat(10000).split("").join("y".repeat(10000))', {})).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('"x".repeat(60000).concat("y".repeat(60000))', {})).toThrow(FGDynamicExpressionError);
+  });
+
+  it('should block custom coercion hooks invoked by native methods', () => {
+    let called = false;
+    const value = {
+      toString(): string {
+        called = true;
+        return 'leaked';
+      }
+    };
+    class Evil {
+      toString(): string {
+        called = true;
+        return 'leaked';
+      }
+    }
+
+    expect(() => evaluateSafeExpression('$vm.items.join("")', { $vm: { items: [value] } })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm.items.join("")', { $vm: { items: [[value]] } })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm.items.join("")', { $vm: { items: [new Evil()] } })).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm.items.toLocaleString()', { $vm: { items: [value] } })).toThrow(FGDynamicExpressionError);
+    expect(called).toBe(false);
+  });
 });

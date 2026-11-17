@@ -7,6 +7,7 @@ Create an Angular standalone signals based dynamic components tree through a JSO
 
 | Angular | fg-dynamic-component | NPM package                   |
 | ------- | -------------------- | ----------------------------- |
+| 22.2.3  | 5.0.0                | `fg-dynamic-component@^5.0.0` |
 | 22.2.3  | 4.0.0                | `fg-dynamic-component@^4.0.0` |
 | 22.2.3  | 3.0.0                | `fg-dynamic-component@^3.0.0` |
 | 22.1.6  | 2.0.0                | `fg-dynamic-component@^2.0.0` |
@@ -50,7 +51,7 @@ FGDynamicService.registerComponent("MyDynamicComponent5", async () => (await imp
 
 @Component({
     selector: "my-component",
-    template: `<fg-dynamic [configuration]="configuration()" />`
+    template: `<fg-dynamic [configuration]="configuration()" [typePolicy]="{ allowFunctionTypes: true }" />`
 })
 class MyComponent {
     configuration = signal({
@@ -79,6 +80,10 @@ class MyComponent {
 }
 ```
 
+> Promise and function loaders execute host code. The examples above opt in with
+> `[typePolicy]="{ allowFunctionTypes: true }"`; omit it when you only use direct
+> component classes or registry names.
+
 #### Standalone API
 
 You may use `<fg-dynamic>` as a standalone component:
@@ -91,7 +96,7 @@ FGDynamicService.registerComponent("MyDynamicComponent5", async () => (await imp
 
 @Component({
     selector: "my-component",
-    template: `<fg-dynamic [configuration]="configuration()" />`,
+    template: `<fg-dynamic [configuration]="configuration()" [typePolicy]="{ allowFunctionTypes: true }" />`,
     imports: [FGDynamicComponent],
     standalone: true
 })
@@ -120,6 +125,9 @@ class MyComponent {
     } as IFGDynamicItem);
 }
 ```
+
+> Promise and function loaders execute host code. The standalone example above
+> opts in with `[typePolicy]="{ allowFunctionTypes: true }"`.
 
 _NOTE:_ You can declare components to dynamically load in static and/or dynamic way using or not the FGDynamicService.
 

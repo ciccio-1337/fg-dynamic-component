@@ -1,4 +1,4 @@
-import { Component, EventEmitter, Input, Output, forwardRef, output, signal } from '@angular/core';
+import { Component, EventEmitter, Input, Output, Type, forwardRef, output, signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { By } from '@angular/platform-browser';
 import { AbstractControl, ControlValueAccessor, FormControl, FormGroup, NG_VALUE_ACCESSOR, ReactiveFormsModule } from '@angular/forms';
@@ -203,11 +203,7 @@ describe('FGDynamicComponent', () => {
     fixture.componentRef.setInput('typePolicy', { allowFunctionTypes: true });
     fixture.componentRef.setInput('configuration', { type: Promise.resolve(TestSimpleComponent) } as IFGDynamicItem);
     fixture.detectChanges();
-    await fixture.whenStable();
-    fixture.detectChanges();
-    await new Promise(r => setTimeout(r, 50));
-    fixture.detectChanges();
-    await fixture.whenStable();
+    await settle(fixture);
     expect(fixture.nativeElement.textContent).toContain('simple');
   });
 
@@ -215,11 +211,7 @@ describe('FGDynamicComponent', () => {
     fixture.componentRef.setInput('typePolicy', { allowFunctionTypes: true });
     fixture.componentRef.setInput('configuration', { type: () => Promise.resolve(TestSimpleComponent) } as IFGDynamicItem);
     fixture.detectChanges();
-    await fixture.whenStable();
-    fixture.detectChanges();
-    await new Promise(r => setTimeout(r, 50));
-    fixture.detectChanges();
-    await fixture.whenStable();
+    await settle(fixture);
     expect(fixture.nativeElement.textContent).toContain('simple');
   });
 
@@ -248,10 +240,9 @@ describe('FGDynamicComponent', () => {
     await fixture.whenStable();
     fixture.detectChanges();
     const host = fixture.nativeElement.querySelector('test-simple') || fixture.nativeElement.firstElementChild;
-    if (host) {
-      expect(host.getAttribute('id')).toBe('test-id');
-      expect(host.getAttribute('data-test')).toBe('value');
-    }
+    expect(host).toBeTruthy();
+    expect(host.getAttribute('id')).toBe('test-id');
+    expect(host.getAttribute('data-test')).toBe('value');
   });
 
   it('should remove attributes when value is null', async () => {
@@ -266,9 +257,8 @@ describe('FGDynamicComponent', () => {
     fixture.detectChanges();
     
     const host = fixture.nativeElement.querySelector('test-simple') || fixture.nativeElement.firstElementChild;
-    if (host) {
-      expect(host.getAttribute('id')).toBeNull();
-    }
+    expect(host).toBeTruthy();
+    expect(host.getAttribute('id')).toBeNull();
   });
 
   it('should handle outputs', async () => {
@@ -1317,5 +1307,213 @@ describe('FGDynamicComponent', () => {
     (component as any).setModelPropertyValue(model, 'marker.label', 'changed');
 
     expect(marker.label).toBe('keep');
+  });
+
+  it('should propagate validator validity to the parent FormGroup', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('viewModel', {});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'email', required: true }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const control = formGroup.get('email');
+    expect(control).toBeTruthy();
+    expect(control!.valid).toBe(false);
+    expect(formGroup.valid).toBe(false);
+    expect(formGroup.status).toBe('INVALID');
+  });
+
+  it('should clear parent validity when a managed validator is removed', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('viewModel', {});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'email', required: true }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(formGroup.valid).toBe(false);
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'email' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(formGroup.get('email')!.valid).toBe(true);
+    expect(formGroup.valid).toBe(true);
+  });
+
+  it('should propagate disabled status to the parent FormGroup', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('viewModel', {});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'email', disabled: true }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const control = formGroup.get('email');
+    expect(control).toBeTruthy();
+    expect(control!.disabled).toBe(true);
+    expect(formGroup.status).toBe('DISABLED');
+  });
+
+  it('should remove managed validators from a reused control on destroy', async () => {
+    const formGroup = new FormGroup({});
+    const existing = new FormControl('');
+    formGroup.addControl('reused', existing);
+
+    fixture.componentRef.setInput('viewModel', {});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('formControlPolicy', { allowExistingControls: true });
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'reused', required: true }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(existing.valid).toBe(false);
+    expect(formGroup.valid).toBe(false);
+
+    fixture.destroy();
+
+    expect(formGroup.get('reused')).toBe(existing);
+    expect(existing.valid).toBe(true);
+    expect(formGroup.valid).toBe(true);
+  });
+
+  it('should synchronize external viewModel changes into the control', async () => {
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('viewModel', { email: 'first' });
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'email' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const control = formGroup.get('email')!;
+    expect(control.value).toBe('first');
+
+    fixture.componentRef.setInput('viewModel', { email: 'second' });
+    await settle(fixture);
+
+    expect(control.value).toBe('second');
+  });
+
+  it('should not execute view-model getters when wiring a form control', async () => {
+    let called = false;
+    const viewModel: Record<string, unknown> = {};
+    Object.defineProperty(viewModel, 'email', {
+      enumerable: true,
+      get(): string {
+        called = true;
+        return 'secret';
+      }
+    });
+
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('viewModel', viewModel);
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'email' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(formGroup.get('email')).toBeTruthy();
+    expect(called).toBe(false);
+  });
+
+  it('should not invoke view-model accessors when the control value changes', async () => {
+    let called = false;
+    const viewModel: Record<string, unknown> = {};
+    Object.defineProperty(viewModel, 'email', {
+      enumerable: true,
+      configurable: true,
+      get(): string {
+        called = true;
+        return 'secret';
+      },
+      set(): void {
+        called = true;
+      }
+    });
+
+    const formGroup = new FormGroup({});
+    fixture.componentRef.setInput('viewModel', viewModel);
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'email' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    (formGroup.get('email') as unknown as FormControl).setValue('next');
+    await settle(fixture);
+
+    expect(called).toBe(false);
+  });
+
+  it('should not create a component when destroyed while loading', async () => {
+    let resolveType: (type: Type<unknown>) => void = () => {};
+    const pending = new Promise<Type<unknown>>((resolve) => {
+      resolveType = resolve;
+    });
+
+    fixture.componentRef.setInput('typePolicy', { allowFunctionTypes: true });
+    fixture.componentRef.setInput('configuration', { type: pending } as IFGDynamicItem);
+    fixture.detectChanges();
+
+    fixture.destroy();
+    resolveType(TestSimpleComponent);
+    await pending;
+    await Promise.resolve();
+
+    expect((component as any)._componentRef).toBeUndefined();
+  });
+
+  it('should ignore invalid nested items instead of rejecting the tree', async () => {
+    fixture.componentRef.setInput('configuration', {
+      type: TestWithNgContentComponent,
+      items: [
+        { type: TestSimpleComponent },
+        null,
+        42,
+        { type: TestAlternateComponent }
+      ]
+    } as unknown as IFGDynamicItem);
+    await settle(fixture);
+
+    expect(fixture.nativeElement.querySelector('test-simple')).toBeTruthy();
+    expect(fixture.nativeElement.querySelector('test-alternate')).toBeTruthy();
+  });
+
+  it('should start reusing a pre-existing control when the policy changes', async () => {
+    const formGroup = new FormGroup({});
+    const existing = new FormControl('initial');
+    formGroup.addControl('shared', existing);
+
+    fixture.componentRef.setInput('viewModel', {});
+    fixture.componentRef.setInput('formGroup', formGroup);
+    fixture.componentRef.setInput('configuration', {
+      type: TestCvaComponent,
+      attributes: { name: 'shared' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    expect((component as any)._formControl).toBeUndefined();
+
+    fixture.componentRef.setInput('formControlPolicy', { allowExistingControls: true });
+    await settle(fixture);
+
+    expect((component as any)._formControl).toBe(existing);
+    expect(formGroup.get('shared')).toBe(existing);
   });
 });

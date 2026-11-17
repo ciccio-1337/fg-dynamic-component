@@ -203,6 +203,148 @@ const SAFE_NATIVE_METHODS: ReadonlySet<Function> = new Set<Function>([
 
 const INTERPRETER_FUNCTIONS = new WeakSet<Function>();
 
+/**
+ * Sentinel returned when an optional link short-circuits. It propagates through
+ * the remaining links of the same postfix chain and becomes `undefined` at an
+ * expression boundary, matching JavaScript `?.` semantics.
+ */
+const OPTIONAL_SHORT_CIRCUIT = Symbol('optional-short-circuit');
+
+function normalizeOptional(value: unknown): unknown {
+    return value === OPTIONAL_SHORT_CIRCUIT ? undefined : value;
+}
+
+/** Native methods that invoke a user-supplied callback. */
+const CALLBACK_NATIVE_METHODS: ReadonlySet<Function> = new Set<Function>([
+    Array.prototype.every,
+    Array.prototype.filter,
+    Array.prototype.find,
+    Array.prototype.findIndex,
+    Array.prototype.flatMap,
+    Array.prototype.forEach,
+    Array.prototype.map,
+    Array.prototype.reduce,
+    Array.prototype.reduceRight,
+    Array.prototype.some,
+    String.prototype.replace,
+    String.prototype.replaceAll
+]);
+
+/**
+ * Prevents a custom function from being smuggled into a native higher-order
+ * method as an argument, which would bypass the callee method policy.
+ */
+function assertSafeCallbackArguments(fn: Function, args: readonly unknown[], options?: FGDynamicExpressionOptions): void {
+    if (!CALLBACK_NATIVE_METHODS.has(fn)) {
+        return;
+    }
+
+    for (const argument of args) {
+        if (typeof argument !== 'function') {
+            continue;
+        }
+        const argumentName = argument.name;
+        if (isNativeFunction(argument) || isInterpreterFunction(argument)) {
+            continue;
+        }
+        if (isMethodAllowed(argumentName, options)) {
+            continue;
+        }
+        fail('Calling custom methods is not allowed.');
+    }
+}
+
+/**
+ * Prevents `join`/`toLocaleString` from invoking a custom `toString`/`valueOf`/
+ * `toLocaleString` hook on an element, which would bypass the method policy.
+ */
+function assertSafeCoercion(fn: Function, thisArg: unknown, options?: FGDynamicExpressionOptions): void {
+    if (fn === Array.prototype.join || fn === Array.prototype.toString) {
+        forEachArrayElement(thisArg, (value: unknown): void => assertSafeCoercionValue(value, options, false));
+        return;
+    }
+    if (fn === Array.prototype.toLocaleString) {
+        forEachArrayElement(thisArg, (value: unknown): void => assertSafeCoercionValue(value, options, true));
+        return;
+    }
+    if (fn === Object.prototype.toLocaleString) {
+        assertSafeCoercionValue(thisArg, options, true);
+    }
+}
+
+function forEachArrayElement(value: unknown, callback: (element: unknown) => void): void {
+    if (value == null || typeof value !== 'object') {
+        return;
+    }
+
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (!lengthDescriptor || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number') {
+        return;
+    }
+    if (lengthDescriptor.value > MAX_STRING_LENGTH) {
+        fail('Array coercion is too large.');
+    }
+
+    // Index access avoids invoking a custom iterator on an Array subclass.
+    for (let index = 0; index < lengthDescriptor.value; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, index);
+        if (!descriptor) {
+            continue;
+        }
+        if (!('value' in descriptor)) {
+            fail('Access to accessor properties is not allowed.');
+        }
+        callback(descriptor.value);
+    }
+}
+
+function assertSafeCoercionValue(value: unknown, options: FGDynamicExpressionOptions | undefined, locale: boolean, depth = 0): void {
+    if (value == null || (typeof value !== 'object' && typeof value !== 'function')) {
+        return;
+    }
+    if (depth > 16) {
+        fail('Coercion chain is nested too deeply.');
+    }
+    if (Array.isArray(value)) {
+        forEachArrayElement(value, (element: unknown): void => assertSafeCoercionValue(element, options, locale, depth + 1));
+        return;
+    }
+
+    const methods = locale ? ['toLocaleString', 'toString', 'valueOf'] : ['toString', 'valueOf'];
+
+    for (const method of methods) {
+        const descriptor = findPropertyDescriptor(value, method);
+        if (!descriptor) {
+            continue;
+        }
+        if (!('value' in descriptor)) {
+            fail('Access to accessor properties is not allowed.');
+        }
+        const hook = descriptor.value;
+        if (typeof hook === 'function'
+            && !isNativeFunction(hook)
+            && !isInterpreterFunction(hook)
+            && !isMethodAllowed(method, options)) {
+            fail('Calling custom methods is not allowed.');
+        }
+    }
+}
+
+/** Finds an own or inherited data descriptor without reading the property. */
+function findPropertyDescriptor(value: object, property: string): PropertyDescriptor | undefined {
+    let current: object | null = value;
+
+    while (current) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, property);
+        if (descriptor) {
+            return descriptor;
+        }
+        current = Object.getPrototypeOf(current);
+    }
+
+    return undefined;
+}
+
 const HOST_OBJECT_TAGS: ReadonlySet<string> = new Set([
     'Window',
     'global',
@@ -975,6 +1117,10 @@ function defineSafeProperty(target: Record<string, unknown>, key: string, value:
 }
 
 function readMember(target: unknown, key: unknown, optional: boolean, options?: FGDynamicExpressionOptions): unknown {
+    if (target === OPTIONAL_SHORT_CIRCUIT) {
+        return target;
+    }
+
     if (typeof key !== 'string' && typeof key !== 'number') {
         fail('Property keys must be strings or numbers.');
     }
@@ -984,7 +1130,7 @@ function readMember(target: unknown, key: unknown, optional: boolean, options?: 
 
     if (target == null) {
         if (optional) {
-            return undefined;
+            return OPTIONAL_SHORT_CIRCUIT;
         }
         fail('Cannot read properties of null or undefined.');
     }
@@ -1124,7 +1270,10 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
 
             case 'Member': {
                 const object = evaluateNode(node.object, environment, state, options);
-                const key = evaluateNode(node.property, environment, state, options);
+                if (object === OPTIONAL_SHORT_CIRCUIT) {
+                    return object;
+                }
+                const key = normalizeOptional(evaluateNode(node.property, environment, state, options));
                 return readMember(object, key, node.optional, options);
             }
 
@@ -1135,20 +1284,32 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
 
                 if (node.callee.type === 'Member') {
                     const object = evaluateNode(node.callee.object, environment, state, options);
-                    const key = evaluateNode(node.callee.property, environment, state, options);
+                    if (object === OPTIONAL_SHORT_CIRCUIT) {
+                        return object;
+                    }
+                    const key = normalizeOptional(evaluateNode(node.callee.property, environment, state, options));
                     fn = readMember(object, key, node.callee.optional, options);
                     thisArg = object;
                     methodName = String(key);
                 } else {
                     fn = evaluateNode(node.callee, environment, state, options);
+                    if (fn === OPTIONAL_SHORT_CIRCUIT) {
+                        return fn;
+                    }
                 }
 
-                if (fn == null && node.optional) {
-                    return undefined;
+                if (fn === OPTIONAL_SHORT_CIRCUIT) {
+                    return fn;
+                }
+                if (fn == null) {
+                    if (node.optional) {
+                        return OPTIONAL_SHORT_CIRCUIT;
+                    }
+                    return fail('Attempted to call a non-function value.');
                 }
                 if (typeof fn !== 'function') {
                     if (node.optional) {
-                        return undefined;
+                        return OPTIONAL_SHORT_CIRCUIT;
                     }
                     return fail('Attempted to call a non-function value.');
                 }
@@ -1174,13 +1335,18 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
 
                 const args: unknown[] = [];
                 for (const argument of node.args) {
-                    const value = evaluateNode(argument.value, environment, state, options);
+                    const value = normalizeOptional(evaluateNode(argument.value, environment, state, options));
                     if (argument.spread) {
                         args.push(...spreadValues(value));
                     } else {
                         args.push(value);
                     }
                 }
+
+                // Native higher-order methods and coercing methods must not
+                // launder custom functions past the callee policy.
+                assertSafeCallbackArguments(fn, args, options);
+                assertSafeCoercion(fn, thisArg, options);
 
                 // Bound native string builders before they allocate.
                 if (fn === String.prototype.repeat) {
@@ -1197,8 +1363,50 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                         return fail('String padding is too large.');
                     }
                 }
-                if (fn === Array.prototype.join && Array.isArray(thisArg) && thisArg.length > MAX_STRING_LENGTH) {
-                    return fail('Array join is too large.');
+                if (fn === String.prototype.replace || fn === String.prototype.replaceAll) {
+                    const search = args[0];
+                    const replacement = args[1];
+                    if (typeof search === 'string' && typeof replacement === 'string' && typeof thisArg === 'string') {
+                        const sourceLength = thisArg.length;
+                        const matchCount = search.length === 0
+                            ? (fn === String.prototype.replaceAll ? sourceLength + 1 : 1)
+                            : Math.floor(sourceLength / search.length);
+                        const growthPerMatch = replacement.length - search.length;
+
+                        if (growthPerMatch > 0 && sourceLength + matchCount * growthPerMatch > MAX_STRING_LENGTH) {
+                            return fail('String replacement is too large.');
+                        }
+                    }
+                }
+                if (fn === Array.prototype.join && Array.isArray(thisArg)) {
+                    const separator = args[0];
+                    if (separator === undefined || typeof separator === 'string') {
+                        const separatorLength = typeof separator === 'string' ? separator.length : 1;
+                        let totalLength = Math.max(0, thisArg.length - 1) * separatorLength;
+
+                        for (let index = 0; index < thisArg.length; index++) {
+                            const element = thisArg[index];
+                            if (element == null) {
+                                continue;
+                            }
+                            if (typeof element === 'string' || typeof element === 'number'
+                                || typeof element === 'boolean' || typeof element === 'bigint') {
+                                totalLength += String(element).length;
+                            } else {
+                                // Object coercion is checked separately and its size
+                                // cannot be bounded without invoking the hook.
+                                totalLength = -1;
+                                break;
+                            }
+                            if (totalLength > MAX_STRING_LENGTH) {
+                                return fail('Array join is too large.');
+                            }
+                        }
+
+                        if (totalLength > MAX_STRING_LENGTH) {
+                            return fail('Array join is too large.');
+                        }
+                    }
                 }
 
                 const result = (fn as (...args: unknown[]) => unknown).apply(thisArg, args);
@@ -1211,7 +1419,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
             }
 
             case 'Unary': {
-                const argument = evaluateNode(node.argument, environment, state, options);
+                const argument = normalizeOptional(evaluateNode(node.argument, environment, state, options));
                 switch (node.operator) {
                     case '!': return !argument;
                     case 'typeof': return typeof argument;
@@ -1231,8 +1439,8 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
             }
 
             case 'Binary': {
-                const left = evaluateNode(node.left, environment, state, options);
-                const right = evaluateNode(node.right, environment, state, options);
+                const left = normalizeOptional(evaluateNode(node.left, environment, state, options));
+                const right = normalizeOptional(evaluateNode(node.right, environment, state, options));
 
                 switch (node.operator) {
                     case '===': return left === right;
@@ -1257,7 +1465,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
             }
 
             case 'Logical': {
-                const left = evaluateNode(node.left, environment, state, options);
+                const left = normalizeOptional(evaluateNode(node.left, environment, state, options));
                 switch (node.operator) {
                     case '&&': return left ? evaluateNode(node.right, environment, state, options) : left;
                     case '||': return left ? left : evaluateNode(node.right, environment, state, options);
@@ -1266,15 +1474,17 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 }
             }
 
-            case 'Conditional':
-                return evaluateNode(node.test, environment, state, options)
+            case 'Conditional': {
+                const test = normalizeOptional(evaluateNode(node.test, environment, state, options));
+                return test
                     ? evaluateNode(node.consequent, environment, state, options)
                     : evaluateNode(node.alternate, environment, state, options);
+            }
 
             case 'Array': {
                 const values: unknown[] = [];
                 for (const element of node.elements) {
-                    const value = evaluateNode(element.value, environment, state, options);
+                    const value = normalizeOptional(evaluateNode(element.value, environment, state, options));
                     if (element.spread) {
                         values.push(...spreadValues(value));
                     } else {
@@ -1288,7 +1498,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 const result: Record<string, unknown> = {};
                 for (const property of node.properties) {
                     if (property.spread) {
-                        const source = evaluateNode(property.value, environment, state, options);
+                        const source = normalizeOptional(evaluateNode(property.value, environment, state, options));
                         if (source == null || typeof source !== 'object') {
                             return fail('Object spread is only supported for objects.');
                         }
@@ -1306,14 +1516,14 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                     }
 
                     const key = property.computed
-                        ? evaluateNode(property.key, environment, state, options)
+                        ? normalizeOptional(evaluateNode(property.key, environment, state, options))
                         : (property.key as { type: 'Literal'; value: unknown }).value;
 
                     if (typeof key !== 'string' && typeof key !== 'number') {
                         return fail('Object keys must be strings or numbers.');
                     }
 
-                    defineSafeProperty(result, String(key), evaluateNode(property.value, environment, state, options));
+                    defineSafeProperty(result, String(key), normalizeOptional(evaluateNode(property.value, environment, state, options)));
                 }
                 return result;
             }
@@ -1328,7 +1538,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                     params.forEach((parameter: string, index: number): void => {
                         local.set(parameter, args[index]);
                     });
-                    return evaluateNode(body, local, state, options);
+                    return normalizeOptional(evaluateNode(body, local, state, options));
                 };
 
                 INTERPRETER_FUNCTIONS.add(arrowFunction);
@@ -1376,5 +1586,5 @@ export function evaluateSafeExpression(
         environment.set(key, value);
     }
 
-    return assertSafeValue(evaluateNode(ast, environment, { steps: 0, depth: 0 }, options));
+    return assertSafeValue(normalizeOptional(evaluateNode(ast, environment, { steps: 0, depth: 0 }, options)));
 }

@@ -3,6 +3,14 @@ import { AbstractControl, ControlValueAccessor, FormControl, FormControlDirectiv
 import { Subscription } from 'rxjs';
 import { evaluateSafeExpression } from './safe-expression';
 
+/** Distinguishes a missing view-model path from a stored `null`/`undefined`. */
+const MISSING_FORM_VALUE = Symbol('missing-form-value');
+
+/** Matches `$vm`, `$event` and the `$ev` alias as identifiers, not substrings. */
+const EXPRESSION_CONTEXT_PATTERN = /\$(?:vm|event|ev)\b/;
+const VM_EXPRESSION_PATTERN = /\$vm\b/;
+const EVENT_EXPRESSION_PATTERN = /\$(?:event|ev)\b/;
+
 export type FGDynamicType = Type<unknown> | Promise<Type<unknown>> | (() => Promise<Type<unknown>>);
 
 export interface IFGDynamicItem {
@@ -197,18 +205,27 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 	depth: InputSignal<number> = input<number>(0);
 
     /**
-     * Validated child items. Invalid entries are ignored and the list is capped
-     * to avoid pathological configurations blocking the renderer.
+     * Cached structural validation for the current configuration. Both
+     * `ngOnChanges` and `items` read this computed, so the tree is validated
+     * once per signal change rather than twice.
+     */
+    private readonly _configurationIsValid: Signal<boolean> = computed((): boolean =>
+        this.validateConfiguration(this.configuration()));
+
+    /**
+     * Child items, capped to avoid pathological configurations blocking the
+     * renderer. Non-object entries are ignored. Structural limits (depth, node
+     * count, cycles) are enforced by `_configurationIsValid`.
      */
     protected readonly items: Signal<readonly IFGDynamicItem[]> = computed((): readonly IFGDynamicItem[] => {
-        if (this.depth() >= MAX_CONFIGURATION_DEPTH) {
+        if (this.depth() >= MAX_CONFIGURATION_DEPTH || !this._configurationIsValid()) {
             return [];
         }
         const configuration = this.configuration();
-        if (!this.validateConfiguration(configuration)) {
+        if (configuration == null || typeof configuration !== 'object' || Array.isArray(configuration)) {
             return [];
         }
-        const items = configuration && typeof configuration === 'object' && !Array.isArray(configuration) ? (configuration as IFGDynamicItem).items : undefined;
+        const items = (configuration as IFGDynamicItem).items;
         if (!Array.isArray(items)) {
             return [];
         }
@@ -234,6 +251,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     private _component?: Type<unknown>;
     private _injector: Injector = inject(Injector);
     private _ngOnChangesCounter = 0;
+    private _destroyed = false;
     private _lastProjectedItemsSignature?: string;
 
     /** Group that literally contains the current control (may be a nested group). */
@@ -247,6 +265,11 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     /** Form wiring currently attached to the rendered component, used to detect rebinds. */
     private _wiredFormGroup?: FormGroup;
     private _wiredControlName?: string;
+    /** `allowExistingControls` value used for the active wiring. */
+    private _wiredAllowExistingControls?: boolean;
+    /** Last value written to the control, used to avoid feedback loops when syncing the model. */
+    private _hasSyncedControlValue = false;
+    private _lastSyncedControlValue: unknown;
     /** Disabled state managed by this component, so it can be restored when `disabled` disappears. */
     private _disabledManaged = false;
     private _disabledBeforeManagement?: boolean;
@@ -262,6 +285,10 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * and before the view and content children are checked.
      */
     async ngOnChanges(changes?: SimpleChanges): Promise<void> {
+        if (this._destroyed) {
+            return;
+        }
+
         const counter = ++this._ngOnChangesCounter;
         try {
             const configuration = this.configuration();
@@ -271,7 +298,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 return;
             }
 
-            if (!this.validateConfiguration(configuration)) {
+            if (!this._configurationIsValid()) {
                 this.logError('Invalid configuration: it exceeds the structural limits.');
                 this.clearResolvedComponent(counter);
                 return;
@@ -281,7 +308,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             // generations are rejected inside `loadComponentAsync`.
             await this.loadComponentAsync(counter);
 
-            if (counter !== this._ngOnChangesCounter) {
+            if (this._destroyed || counter !== this._ngOnChangesCounter) {
                 return;
             }
 
@@ -303,7 +330,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             // Instantiates a single component and inserts its host view into this container.
             this.createComponent();
 
-            if (counter !== this._ngOnChangesCounter) {
+            if (this._destroyed || counter !== this._ngOnChangesCounter) {
                 return;
             }
 
@@ -313,6 +340,8 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             this.setFormControlStatus();
             // Add synchronous validators to this control.
             this.setFormControlValidators();
+            // Reflect external view-model changes into the control.
+            this.syncFormControlFromViewModel();
             // Set attribute values for an element in the DOM.
             this.setAttributes();
             // Re-wire outputs if they changed
@@ -334,7 +363,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * Ignored when a newer `ngOnChanges` generation has started.
      */
     private clearResolvedComponent(counter: number): void {
-        if (counter !== this._ngOnChangesCounter) {
+        if (this._destroyed || counter !== this._ngOnChangesCounter) {
             return;
         }
         this._component = undefined;
@@ -374,7 +403,12 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             const item = current.item;
 
             if (item == null || typeof item !== 'object' || Array.isArray(item)) {
-                return null;
+                if (current.depth === 0) {
+                    return null;
+                }
+                // Invalid nested entries are filtered out by `items`; skip them
+                // here instead of rejecting the whole configuration tree.
+                continue;
             }
             if (seen.has(item)) {
                 // Reject cycles and repeated references to the same node.
@@ -765,7 +799,11 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         const controlName = this.resolveFormControlName();
         const desiredGroup = formGroup && controlName ? formGroup : undefined;
 
-        if (this._wiredFormGroup !== desiredGroup || this._wiredControlName !== controlName) {
+        const allowExistingControls = this.formControlPolicy()?.allowExistingControls === true;
+        const policyChanged = desiredGroup !== undefined
+            && this._wiredAllowExistingControls !== allowExistingControls;
+
+        if (this._wiredFormGroup !== desiredGroup || this._wiredControlName !== controlName || policyChanged) {
             this.cleanup();
         }
     }
@@ -794,6 +832,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 
         const parent = this.ensureFormGroupPath(formGroup, path.slice(0, -1));
         if (!parent) {
+            this.pruneCreatedFormGroups();
             this._wiredFormGroup = undefined;
             this._wiredControlName = undefined;
             return;
@@ -805,6 +844,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         if (existing) {
             if (this.formControlPolicy()?.allowExistingControls !== true) {
                 this.logWarning('A form control with the requested name already exists; reuse is disabled by formControlPolicy.');
+                this.pruneCreatedFormGroups();
                 this._wiredFormGroup = undefined;
                 this._wiredControlName = undefined;
                 return;
@@ -812,6 +852,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 
             if (!(existing instanceof FormControl)) {
                 this.logWarning('A form control with the requested name already exists and is not a FormControl.');
+                this.pruneCreatedFormGroups();
                 this._wiredFormGroup = undefined;
                 this._wiredControlName = undefined;
                 return;
@@ -831,6 +872,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 this._ownsFormControl = true;
             } catch (error) {
                 this.logError('Error adding form control.', error);
+                this.pruneCreatedFormGroups();
                 return;
             }
         }
@@ -839,7 +881,10 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         this._formControlKey = key;
         this._wiredFormGroup = formGroup;
         this._wiredControlName = name;
+        this._wiredAllowExistingControls = this.formControlPolicy()?.allowExistingControls === true;
         this._disabledBeforeManagement = this._formControl.disabled;
+        this._lastSyncedControlValue = this._formControl.value;
+        this._hasSyncedControlValue = true;
 
         // Synchronizes a standalone FormControl instance to a form control element.
         this.attachFormControlDirective();
@@ -862,6 +907,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                     current.addControl(segment, group);
                 } catch (error) {
                     this.logError('Error creating nested form group.', error);
+                    this.pruneCreatedFormGroups();
                     return null;
                 }
                 this._createdFormGroups.push({ parent: current, key: segment, group });
@@ -869,11 +915,13 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             } else if (existing instanceof FormGroup) {
                 if (this.formControlPolicy()?.allowExistingControls !== true) {
                     this.logWarning(`Cannot reuse existing nested form group "${segment}" because formControlPolicy disables it.`);
+                    this.pruneCreatedFormGroups();
                     return null;
                 }
                 current = existing;
             } else {
                 this.logWarning(`Cannot create nested form group "${segment}" because a different control already exists.`);
+                this.pruneCreatedFormGroups();
                 return null;
             }
         }
@@ -900,13 +948,19 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 return;
             }
 
-            // Clone plain objects/arrays so sibling values are preserved, while
-            // functions and non-plain objects (class instances, DOM nodes, ...)
-            // are kept by reference instead of being dropped.
-            const viewModel = this.cloneForMutation(currentModel);
-
+            // Clone only the containers along the path so sibling subtrees are
+            // shared and the update stays O(path) instead of O(view model).
+            const path = this.parsePath(name);
+            if (!path) {
+                return;
+            }
+            const viewModel = this.cloneAlongPathForMutation(currentModel, path);
             // Sets the value at path of object.
-            this.setModelPropertyValue(viewModel, name, value);
+            this.setModelPropertyValue(viewModel, path, value);
+
+            this._lastSyncedControlValue = value;
+            this._hasSyncedControlValue = true;
+
             // Directly set the signal to a new value, and notify any dependents.
             try {
                 this.viewModel.set(viewModel);
@@ -922,40 +976,154 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     }
 
     /**
-     * Deep-clones arrays and plain objects, preserving functions and non-plain
-     * objects by reference. Handles cycles through a `WeakMap`.
+     * Clones only the containers along `path`, sharing every other subtree.
+     * Accessor properties are preserved without being invoked.
      */
-    private cloneForMutation(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
-        if (value == null || typeof value !== 'object') {
+    private cloneAlongPathForMutation(value: unknown, path: string[]): unknown {
+        if (path.length === 0 || !this.isMutableContainer(value)) {
             return value;
         }
 
-        const source = value as object;
-        if (seen.has(source)) {
-            return seen.get(source);
+        const copy = this.cloneContainerShallow(value as object);
+        if (path.length === 1) {
+            return copy;
+        }
+
+        const descriptor = Object.getOwnPropertyDescriptor(value as object, path[0]);
+        if (!descriptor || !('value' in descriptor)) {
+            return copy;
+        }
+
+        const child = descriptor.value;
+        if (child == null || !this.isMutableContainer(child)) {
+            return copy;
+        }
+
+        this.defineOwn(copy, path[0], this.cloneAlongPathForMutation(child, path.slice(1)));
+        return copy;
+    }
+
+    /** Shallow-copies own descriptors without invoking getters. */
+    private cloneContainerShallow(value: object): Record<string, unknown> {
+        const copy: any = Array.isArray(value) ? [] : {};
+
+        for (const key of Object.keys(value)) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            if (!descriptor) {
+                continue;
+            }
+            if ('value' in descriptor) {
+                this.defineOwn(copy, key, descriptor.value);
+            } else {
+                Object.defineProperty(copy, key, descriptor);
+            }
         }
 
         if (Array.isArray(value)) {
-            const copy: unknown[] = [];
-            seen.set(source, copy);
-            for (const item of value) {
-                copy.push(this.cloneForMutation(item, seen));
-            }
-            return copy;
+            copy.length = value.length;
         }
 
-        const prototype = Object.getPrototypeOf(value);
-        if (prototype === Object.prototype || prototype === null) {
-            const copy: Record<string, unknown> = {};
-            seen.set(source, copy);
-            for (const key of Object.keys(value as Record<string, unknown>)) {
-                this.defineOwn(copy, key, this.cloneForMutation((value as Record<string, unknown>)[key], seen));
-            }
-            return copy;
+        return copy;
+    }
+
+    /**
+     * Reflects external view-model changes into the control. Values written by
+     * the control itself are skipped to avoid clobbering user input.
+     */
+    private syncFormControlFromViewModel(): void {
+        if (!this._formControl || !this._hasSyncedControlValue) {
+            return;
         }
 
-        // Class instances, Date, Map, DOM nodes, observables, ... are preserved.
-        return value;
+        const name = this._wiredControlName;
+        const model = this.getViewModelValue();
+        if (!name || model == null) {
+            return;
+        }
+
+        const path = this.parsePath(name);
+        if (!path) {
+            return;
+        }
+
+        const nextValue = this.getModelPropertyValue(model, path, MISSING_FORM_VALUE);
+        if (nextValue === MISSING_FORM_VALUE || this.valuesEqual(nextValue, this._lastSyncedControlValue)) {
+            return;
+        }
+
+        try {
+            this._formControl.setValue(nextValue, { emitEvent: false });
+            this._lastSyncedControlValue = nextValue;
+        } catch (error) {
+            this.logError('Error synchronizing the form control with the view model.', error);
+        }
+    }
+
+    /** Bounded structural comparison used to detect real view-model changes. */
+    private valuesEqual(left: unknown, right: unknown, depth = 0): boolean {
+        if (Object.is(left, right)) {
+            return true;
+        }
+        if (depth >= 8 || left == null || right == null
+            || typeof left !== 'object' || typeof right !== 'object') {
+            return false;
+        }
+        if (Array.isArray(left) !== Array.isArray(right)) {
+            return false;
+        }
+        if (Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)) {
+            return false;
+        }
+
+        const leftKeys = Object.keys(left);
+        const rightKeys = Object.keys(right);
+        if (leftKeys.length !== rightKeys.length) {
+            return false;
+        }
+
+        for (const key of leftKeys) {
+            if (!Object.hasOwn(right, key)) {
+                return false;
+            }
+            const leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
+            const rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
+            if (!leftDescriptor || !rightDescriptor || !('value' in leftDescriptor) || !('value' in rightDescriptor)) {
+                return false;
+            }
+            if (!this.valuesEqual(leftDescriptor.value, rightDescriptor.value, depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Removes created intermediate groups that are detached or still empty.
+     * Used after a failed wiring attempt and during cleanup.
+     */
+    private pruneCreatedFormGroups(): void {
+        const kept: Array<{ parent: FormGroup; key: string; group: FormGroup }> = [];
+
+        for (let index = this._createdFormGroups.length - 1; index >= 0; index--) {
+            const entry = this._createdFormGroups[index];
+            let remove = false;
+
+            try {
+                remove = entry.parent.get(entry.key) === entry.group
+                    && Object.keys(entry.group.controls).length === 0;
+                if (remove) {
+                    entry.parent.removeControl(entry.key);
+                }
+            } catch {
+                remove = false;
+            }
+
+            if (!remove) {
+                kept.unshift(entry);
+            }
+        }
+
+        this._createdFormGroups = kept;
     }
 
     private setControlDisabled(disabled: boolean): void {
@@ -966,12 +1134,10 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         try {
             if (disabled && this._formControl.enabled) {
                 this._formControl.disable({
-                    onlySelf: true,
                     emitEvent: false
                 });
             } else if (!disabled && this._formControl.disabled) {
                 this._formControl.enable({
-                    onlySelf: true,
                     emitEvent: false
                 });
             }
@@ -1049,7 +1215,6 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             
             try {
                 this._formControl.updateValueAndValidity({
-                    onlySelf: true,
                     emitEvent: false
                 });
             } catch (error) {
@@ -1134,7 +1299,6 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             // managed validator set changes (including when it becomes empty).
             try {
                 this._formControl.updateValueAndValidity({
-                    onlySelf: true,
                     emitEvent: false
                 });
             } catch (error) {
@@ -1348,8 +1512,16 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         if (this._formControlDirective && this._componentRef?.injector && this._formControl) {
             try {
                 const valueAccessors: ControlValueAccessor[] | null = this._componentRef.injector.get<ControlValueAccessor[] | null>(NG_VALUE_ACCESSOR, null);
-                
-                this._formControlDirective.valueAccessor = Array.isArray(valueAccessors) && valueAccessors.length > 0 ? valueAccessors[0] : null;
+                const valueAccessor = Array.isArray(valueAccessors) && valueAccessors.length > 0 ? valueAccessors[0] : null;
+
+                if (!valueAccessor) {
+                    this.logWarning('The dynamic component does not provide an NG_VALUE_ACCESSOR; the form control will not be bound to its view.');
+                }
+
+                // NOTE: `valueAccessor`/`form` and `ngOnChanges` are the public
+                // surface Angular's `FormControlDirective` uses internally; this
+                // keeps the standalone control attachable without a template.
+                this._formControlDirective.valueAccessor = valueAccessor;
                 this._formControlDirective.form = this._formControl;
 
                 // A callback method that is invoked immediately after the default change detector has checked data-bound properties if at least one has changed, and before the view and content children are checked.
@@ -1568,7 +1740,12 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 if (!Object.hasOwn(container, key)) {
                     return defaultValue;
                 }
-                current = container[key];
+                const descriptor = Object.getOwnPropertyDescriptor(container, key);
+                if (!descriptor || !('value' in descriptor)) {
+                    // Never execute a getter from the view model.
+                    return defaultValue;
+                }
+                current = descriptor.value;
             }
 
             return current != null ? current : defaultValue;
@@ -1608,12 +1785,26 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 }
 
                 if (isLast) {
+                    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+                    if (descriptor && !('value' in descriptor)) {
+                        // Never overwrite an accessor (which could run its setter).
+                        return;
+                    }
                     this.defineOwn(current, key, value);
                     return;
                 }
 
                 const isNumericKey = /^\d+$/.test(key);
-                const existing = Object.hasOwn(current, key) ? current[key] : undefined;
+                let existing: unknown;
+
+                if (Object.hasOwn(current, key)) {
+                    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+                    if (!descriptor || !('value' in descriptor)) {
+                        // Never traverse or overwrite an accessor property.
+                        return;
+                    }
+                    existing = descriptor.value;
+                }
 
                 if (existing == null) {
                     // Create array if key is numeric, otherwise object.
@@ -1860,7 +2051,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
     private isUnresolvedExpression(source: unknown, result: unknown): boolean {
         return typeof source === 'string'
             && result === source
-            && (source.includes('$vm') || source.includes('$event') || source.includes('$ev'));
+            && EXPRESSION_CONTEXT_PATTERN.test(source);
     }
 
     /**
@@ -1898,8 +2089,8 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             return value;
         }
 
-        const hasVm = value.includes('$vm');
-        const hasEvent = value.includes('$event') || value.includes('$ev');
+        const hasVm = VM_EXPRESSION_PATTERN.test(value);
+        const hasEvent = EVENT_EXPRESSION_PATTERN.test(value);
 
         if (!hasVm && !hasEvent) {
             return value;
@@ -1995,6 +2186,17 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 
         this._formControlSubscription = undefined;
 
+        // Remove validators added by this component. Owned controls are removed
+        // below, but reused controls stay in their group and must not keep them.
+        if (this._formControl && this._managedValidatorFns.length > 0) {
+            try {
+                this._formControl.removeValidators(this._managedValidatorFns);
+                this._formControl.updateValueAndValidity({ emitEvent: false });
+            } catch (error) {
+                this.logError('Error removing managed validators.', error);
+            }
+        }
+
         // Restore the disabled state of reused controls before detaching.
         this.restoreManagedDisabledState();
 
@@ -2023,17 +2225,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 
         // Remove intermediate groups created for dotted names, deepest first,
         // but only if they are still empty and still attached to the parent.
-        for (let index = this._createdFormGroups.length - 1; index >= 0; index--) {
-            const { parent, key, group } = this._createdFormGroups[index];
-            try {
-                if (parent.get(key) === group && Object.keys(group.controls).length === 0) {
-                    parent.removeControl(key);
-                }
-            } catch (e) {
-                // Ignore
-            }
-        }
-
+        this.pruneCreatedFormGroups();
         this._createdFormGroups = [];
         this._formControl = undefined;
         this._formControlContainer = undefined;
@@ -2043,6 +2235,9 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
         this._disabledBeforeManagement = undefined;
         this._wiredFormGroup = undefined;
         this._wiredControlName = undefined;
+        this._wiredAllowExistingControls = undefined;
+        this._hasSyncedControlValue = false;
+        this._lastSyncedControlValue = undefined;
         this._managedValidatorFns = [];
         this._appliedAttributes.clear();
         this._appliedInputs.clear();
@@ -2063,6 +2258,8 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
      * A callback method that performs custom clean-up, invoked immediately before a directive, pipe, or service instance is destroyed.
      */
 	ngOnDestroy(): void {
+        this._destroyed = true;
+        this._ngOnChangesCounter++;
         this.cleanup();
 	}
 }
