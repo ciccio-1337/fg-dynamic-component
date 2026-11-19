@@ -1,7 +1,9 @@
 import { ChangeDetectionStrategy, Component, ComponentRef, ElementRef, Injector, InputSignal, ModelSignal, OnChanges, OnDestroy, Renderer2, Signal, SimpleChanges, Type, ViewContainerRef, computed, inject, input, isDevMode, model, viewChild, viewChildren } from '@angular/core';
 import { AbstractControl, ControlValueAccessor, FormControl, FormControlDirective, FormGroup, NG_VALUE_ACCESSOR, NgControl, ValidationErrors, ValidatorFn, Validators } from '@angular/forms';
 import { Subscription } from 'rxjs';
-import { evaluateSafeExpression } from './safe-expression';
+import { evaluateSafeExpression, type FGDynamicAllowedMethod } from './safe-expression';
+
+export type { FGDynamicAllowedMethod } from './safe-expression';
 
 /** Distinguishes a missing view-model path from a stored `null`/`undefined`. */
 const MISSING_FORM_VALUE = Symbol('missing-form-value');
@@ -29,8 +31,12 @@ export interface IFGDynamicItem {
 export interface IFGDynamicExpressionPolicy {
     /** Allow calling any method reachable from the view model. Defaults to `false`. */
     allowCustomMethods?: boolean;
-    /** Method names that may be called when `allowCustomMethods` is `false`. */
-    allowedMethods?: readonly string[];
+    /**
+     * Methods that may be called when `allowCustomMethods` is `false`.
+     * String entries are scoped to `$vm` and the value returned by `$vm()`;
+     * use `{ name, receiver: 'any' }` or `{ name, on }` to grant a nested method.
+     */
+    allowedMethods?: readonly (string | FGDynamicAllowedMethod)[];
     /** Expose `$vm.set` and `$vm.update`. Defaults to `false`. */
     allowViewModelMutation?: boolean;
 }
@@ -64,6 +70,13 @@ export interface IFGDynamicTypePolicy {
 export interface IFGDynamicAttributePolicy {
     /** Disallow `id`, `class`, `for`, `href` and `src`. Defaults to `false`. */
     strict?: boolean;
+    /**
+     * Allow `href`/`src` to point at other origins (including protocol-relative
+     * URLs). Defaults to `false`: relative and same-origin URLs only, so an
+     * untrusted configuration cannot exfiltrate view-model data by rendering a
+     * request to an attacker-controlled host.
+     */
+    allowExternalUrls?: boolean;
 }
 
 const FORBIDDEN_PATH_SEGMENTS: ReadonlySet<string> = new Set(['__proto__', 'prototype', 'constructor']);
@@ -2023,6 +2036,12 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             return true;
         }
 
+        // Protocol-relative URLs inherit the page scheme but can target any
+        // origin, so they require the same opt-in as absolute external URLs.
+        if (normalized.startsWith('//')) {
+            return this.allowsExternalUrls();
+        }
+
         const scheme = /^([a-z][a-z0-9+.-]*):/.exec(normalized);
 
         if (!scheme) {
@@ -2030,7 +2049,34 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
             return true;
         }
 
-        return scheme[1] === 'http' || scheme[1] === 'https' || scheme[1] === 'mailto' || scheme[1] === 'tel';
+        if (scheme[1] === 'mailto' || scheme[1] === 'tel') {
+            return true;
+        }
+
+        if (scheme[1] !== 'http' && scheme[1] !== 'https') {
+            return false;
+        }
+
+        return this.allowsExternalUrls() || this.isSameOriginUrl(value);
+    }
+
+    private allowsExternalUrls(): boolean {
+        return this.attributePolicy()?.allowExternalUrls === true;
+    }
+
+    /**
+     * Resolves `value` against the document base URL and compares origins. In a
+     * non-browser environment absolute URLs are treated as external.
+     */
+    private isSameOriginUrl(value: string): boolean {
+        if (typeof document === 'undefined' || !document.baseURI) {
+            return false;
+        }
+        try {
+            return new URL(value, document.baseURI).origin === new URL(document.baseURI).origin;
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -2106,7 +2152,9 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
 
         try {
             const policy = this.expressionPolicy() ?? {};
-            const allowedMethods = new Set<string>(Array.isArray(policy.allowedMethods) ? policy.allowedMethods : []);
+            const allowedMethods: (string | FGDynamicAllowedMethod)[] = Array.isArray(policy.allowedMethods)
+                ? [...policy.allowedMethods]
+                : [];
 
             // Expose the view model as a callable (`$vm()`). The ModelSignal
             // helpers are only attached when the host opts into mutation.
@@ -2119,8 +2167,8 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 $vm.update = (updateFn: (current: unknown) => unknown): void => {
                     this.viewModel.update(updateFn);
                 };
-                allowedMethods.add('set');
-                allowedMethods.add('update');
+                allowedMethods.push('set');
+                allowedMethods.push('update');
             }
 
             return evaluateSafeExpression(value, {
@@ -2129,7 +2177,7 @@ export class FGDynamicComponent implements OnChanges, OnDestroy {
                 $ev: eventParam
             }, {
                 allowCustomMethods: policy.allowCustomMethods === true,
-                allowedMethods: Array.from(allowedMethods)
+                allowedMethods
             });
         } catch {
             this.logWarning('Expression could not be evaluated safely and was ignored.');

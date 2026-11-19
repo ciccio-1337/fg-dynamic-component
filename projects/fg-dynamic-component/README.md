@@ -275,9 +275,13 @@ class MyComponent {
 > `data-*` or `aria-*` attribute.
 >
 > Event handlers (`on*`), `style`, `srcdoc`, `formaction`, namespaced attributes
-> and non-primitive values are ignored. `href` and `src` only accept `http`,
-> `https`, `mailto`, `tel` and relative URLs, so `javascript:` URLs are blocked
-> even when they come from an expression.
+> and non-primitive values are ignored. `href` and `src` accept relative and
+> same-origin URLs plus `mailto:` and `tel:`; cross-origin and protocol-relative
+> URLs are rejected by default, so an untrusted configuration cannot exfiltrate
+> view-model data by pointing an image or link at an attacker-controlled host.
+> Opt into external URLs for trusted configurations with
+> `[attributePolicy]="{ allowExternalUrls: true }"`. `javascript:` and `data:`
+> URLs stay blocked even when they come from an expression.
 >
 > Boolean attributes (`hidden`, `disabled`, `readonly`, `required`, `checked`,
 > `selected`, `multiple`) follow HTML presence semantics: a truthy value adds
@@ -385,11 +389,23 @@ template: `<fg-dynamic [configuration]="configuration()" [expressionPolicy]="{ a
 are not exposed by default; enable view-model mutation explicitly with
 `[expressionPolicy]="{ allowViewModelMutation: true }"`.
 
+`allowedMethods` entries are **receiver-scoped to the root view model**: the
+string form allows `$vm().save()` but not `$vm().nested.save()`, so granting one
+method name does not unlock every reachable object with the same name. When a
+nested capability is intentional, use the descriptor form
+`{ name: 'save', on: someObject }` (or `{ name: 'save', receiver: 'any' }` for a
+fully trusted view model).
+
+Arrow parameters cannot rebind the host identifiers `$vm`, `$event` or `$ev`, and
+the method policy also covers coercion hooks (`toString`, `valueOf`,
+`Symbol.toPrimitive`, `Symbol.isConcatSpreadable`) on both receivers and
+arguments, so native string/array methods cannot be used to invoke host code.
+
 > Treat configurations as untrusted data unless they come from your own code.
 > For multi-tenant/plugin scenarios prefer a scoped registry,
 > `expressionPolicy.allowedMethods`, `formControlPolicy.allowedControlNames`,
 > `[typePolicy]="{ requireScopedRegistry: true }"` and
-> `[attributePolicy]="{ strict: true }"`.
+> `[attributePolicy]="{ strict: true }"` (leave `allowExternalUrls` disabled).
 
 #### Component type policy
 

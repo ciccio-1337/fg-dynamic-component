@@ -183,4 +183,79 @@ describe('evaluateSafeExpression', () => {
     expect(() => evaluateSafeExpression('$vm.items.toLocaleString()', { $vm: { items: [value] } })).toThrow(FGDynamicExpressionError);
     expect(called).toBe(false);
   });
+
+  it('should not let arrow parameters shadow the $vm capability', () => {
+    const evil = vi.fn(() => 'called');
+    const variables = { $vm: () => ({ items: [evil], fns: [evil] }) };
+
+    expect(() => evaluateSafeExpression('$vm().items.map($vm => $vm())', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('(($vm) => $vm())($vm().fns.at(0))', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm => $vm', variables)).toThrow(FGDynamicExpressionError);
+    expect(evil).not.toHaveBeenCalled();
+  });
+
+  it('should scope allowed methods to the root view model', () => {
+    const save = vi.fn();
+    const nestedSave = vi.fn();
+    const variables = { $vm: () => ({ save, nested: { save: nestedSave } }) };
+
+    expect(evaluateSafeExpression('$vm().save()', variables, { allowedMethods: ['save'] })).toBeUndefined();
+    expect(save).toHaveBeenCalledTimes(1);
+
+    expect(() => evaluateSafeExpression('$vm().nested.save()', variables, { allowedMethods: ['save'] }))
+      .toThrow(FGDynamicExpressionError);
+    expect(nestedSave).not.toHaveBeenCalled();
+  });
+
+  it('should support explicit receiver grants for allowed methods', () => {
+    const nested = { save: vi.fn() };
+    const variables = { $vm: () => ({ nested }) };
+
+    expect(evaluateSafeExpression('$vm().nested.save()', variables, {
+      allowedMethods: [{ name: 'save', receiver: 'any' }]
+    })).toBeUndefined();
+    expect(nested.save).toHaveBeenCalledTimes(1);
+
+    expect(evaluateSafeExpression('$vm().nested.save()', variables, {
+      allowedMethods: [{ name: 'save', on: nested }]
+    })).toBeUndefined();
+    expect(nested.save).toHaveBeenCalledTimes(2);
+  });
+
+  it('should block custom coercion hooks passed as arguments', () => {
+    const separator = { toString: vi.fn(() => '-') };
+    const replacement = { toString: vi.fn(() => 'X') };
+    const variables = { $vm: () => ({ items: ['a', 'b'], text: 'abc', separator, replacement }) };
+
+    expect(() => evaluateSafeExpression('$vm().items.join($vm().separator)', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm().text.replace("a", $vm().replacement)', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm().text.padStart(10, $vm().separator)', variables)).toThrow(FGDynamicExpressionError);
+    expect(separator.toString).not.toHaveBeenCalled();
+    expect(replacement.toString).not.toHaveBeenCalled();
+  });
+
+  it('should block Symbol.toPrimitive hooks during coercion', () => {
+    const toPrimitive = vi.fn(() => 'X');
+    const item = { [Symbol.toPrimitive]: toPrimitive };
+    const variables = { $vm: () => ({ items: [item] }) };
+
+    expect(() => evaluateSafeExpression('$vm().items.join("")', variables)).toThrow(FGDynamicExpressionError);
+    expect(() => evaluateSafeExpression('$vm().items.toLocaleString()', variables)).toThrow(FGDynamicExpressionError);
+    expect(toPrimitive).not.toHaveBeenCalled();
+  });
+
+  it('should not invoke a Symbol.toStringTag getter', () => {
+    let called = false;
+    const value: Record<string, unknown> = { data: 'ok' };
+    Object.defineProperty(value, Symbol.toStringTag, {
+      get(): string {
+        called = true;
+        return 'Plain';
+      }
+    });
+
+    expect(() => evaluateSafeExpression('$vm().value.data', { $vm: () => ({ value }) }))
+      .toThrow(FGDynamicExpressionError);
+    expect(called).toBe(false);
+  });
 });

@@ -473,10 +473,41 @@ describe('FGDynamicComponent', () => {
     expect(host.getAttribute('src')).toBeNull();
   });
 
-  it('should allow safe absolute and relative URLs', async () => {
+  it('should block cross-origin and protocol-relative URLs by default', async () => {
     fixture.componentRef.setInput('configuration', {
       type: TestSimpleComponent,
-      attributes: { href: 'https://example.com/docs', src: '/assets/icon.svg' }
+      attributes: { href: 'https://example.com/docs', src: '//cdn.example.com/icon.svg' }
+    } as IFGDynamicItem);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const host: HTMLElement = fixture.nativeElement.querySelector('test-simple') || fixture.nativeElement.firstElementChild;
+    expect(host.getAttribute('href')).toBeNull();
+    expect(host.getAttribute('src')).toBeNull();
+  });
+
+  it('should allow relative and same-origin URLs without opting in', async () => {
+    const sameOrigin = new URL('/docs', document.baseURI).href;
+
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { href: sameOrigin, src: '/assets/icon.svg' }
+    } as IFGDynamicItem);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const host: HTMLElement = fixture.nativeElement.querySelector('test-simple') || fixture.nativeElement.firstElementChild;
+    expect(host.getAttribute('href')).toBe(sameOrigin);
+    expect(host.getAttribute('src')).toBe('/assets/icon.svg');
+  });
+
+  it('should allow external URLs when the attribute policy opts in', async () => {
+    fixture.componentRef.setInput('attributePolicy', { allowExternalUrls: true });
+    fixture.componentRef.setInput('configuration', {
+      type: TestSimpleComponent,
+      attributes: { href: 'https://example.com/docs', src: '//cdn.example.com/icon.svg' }
     } as IFGDynamicItem);
     fixture.detectChanges();
     await fixture.whenStable();
@@ -484,7 +515,7 @@ describe('FGDynamicComponent', () => {
 
     const host: HTMLElement = fixture.nativeElement.querySelector('test-simple') || fixture.nativeElement.firstElementChild;
     expect(host.getAttribute('href')).toBe('https://example.com/docs');
-    expect(host.getAttribute('src')).toBe('/assets/icon.svg');
+    expect(host.getAttribute('src')).toBe('//cdn.example.com/icon.svg');
   });
 
   it('should not allow prototype pollution through attribute paths', async () => {
@@ -1007,6 +1038,44 @@ describe('FGDynamicComponent', () => {
 
     expect(done).toHaveBeenCalledTimes(1);
     expect(done).toHaveBeenCalledWith(undefined);
+  });
+
+  it('should not grant a nested method through a string allowlist entry', async () => {
+    const nestedDone = vi.fn();
+    fixture.componentRef.setInput('expressionPolicy', { allowedMethods: ['done'] });
+    fixture.componentRef.setInput('viewModel', { nested: { done: nestedDone } });
+    fixture.componentRef.setInput('configuration', {
+      type: TestVoidOutputComponent,
+      outputs: { done: '$vm().nested.done($event)' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const button: HTMLButtonElement | null = fixture.nativeElement.querySelector('button');
+    expect(button).toBeTruthy();
+    button!.click();
+    await settle(fixture);
+
+    expect(nestedDone).not.toHaveBeenCalled();
+  });
+
+  it('should honor explicit receiver grants in the expression policy', async () => {
+    const nestedDone = vi.fn();
+    fixture.componentRef.setInput('expressionPolicy', {
+      allowedMethods: [{ name: 'done', receiver: 'any' }]
+    });
+    fixture.componentRef.setInput('viewModel', { nested: { done: nestedDone } });
+    fixture.componentRef.setInput('configuration', {
+      type: TestVoidOutputComponent,
+      outputs: { done: '$vm().nested.done($event)' }
+    } as IFGDynamicItem);
+    await settle(fixture);
+
+    const button: HTMLButtonElement | null = fixture.nativeElement.querySelector('button');
+    expect(button).toBeTruthy();
+    button!.click();
+    await settle(fixture);
+
+    expect(nestedDone).toHaveBeenCalledTimes(1);
   });
 
   it('should treat boolean attributes as presence/absence', async () => {

@@ -33,6 +33,20 @@ const MAX_STRING_LENGTH = 100000;
 const MAX_REPEAT_COUNT = 10000;
 
 /**
+ * A single method capability granted to expressions.
+ *
+ * `receiver` defaults to `'root'`, which only permits the call on the `$vm`
+ * capability or on the value returned by `$vm()`. Granting a method name to
+ * every reachable object (`'any'`) is only safe for fully trusted view models;
+ * `on` pins the capability to one object identity.
+ */
+export interface FGDynamicAllowedMethod {
+    name: string;
+    receiver?: 'root' | 'any';
+    on?: object;
+}
+
+/**
  * Public policy for expression evaluation.
  *
  * By default expressions are read-only and can only call native built-ins
@@ -43,10 +57,21 @@ const MAX_REPEAT_COUNT = 10000;
 export interface FGDynamicExpressionOptions {
     /** Allow calling any method found on a view-model value. Defaults to `false`. */
     allowCustomMethods?: boolean;
-    /** Method names that may be called even when `allowCustomMethods` is false. */
-    allowedMethods?: readonly string[];
+    /**
+     * Methods that may be called even when `allowCustomMethods` is false.
+     * String entries are root-scoped: they apply to `$vm` and the value returned
+     * by `$vm()`, not to arbitrary nested objects.
+     */
+    allowedMethods?: readonly (string | FGDynamicAllowedMethod)[];
 }
 
+/**
+ * Identifiers bound by the host that an arrow parameter must never shadow.
+ * Shadowing `$vm` used to turn a parameter into a trusted direct-call target.
+ */
+const RESERVED_BINDING_NAMES: ReadonlySet<string> = new Set(['$vm', '$event', '$ev']);
+
+/** Property names that may never be read, written or used as bindings. */
 const FORBIDDEN_PROPERTIES: ReadonlySet<string> = new Set([
     '__proto__',
     'prototype',
@@ -201,6 +226,36 @@ const SAFE_NATIVE_METHODS: ReadonlySet<Function> = new Set<Function>([
     Object.prototype.valueOf
 ]);
 
+/**
+ * Native protocol hooks that may run while `join`/`concat`/`String()` coerce a
+ * value. Custom implementations are rejected; built-ins such as
+ * `Date.prototype.toString` are harmless.
+ */
+const SAFE_COERCION_HOOKS: ReadonlySet<Function> = new Set<Function>([
+    Object.prototype.toString,
+    Object.prototype.valueOf,
+    Object.prototype.toLocaleString,
+    Array.prototype.toString,
+    Array.prototype.toLocaleString,
+    Date.prototype.toString,
+    Date.prototype.valueOf,
+    Date.prototype.toLocaleString,
+    Date.prototype.toLocaleDateString,
+    Date.prototype.toLocaleTimeString,
+    Date.prototype[Symbol.toPrimitive],
+    Number.prototype.toString,
+    Number.prototype.valueOf,
+    Number.prototype.toLocaleString,
+    String.prototype.toString,
+    String.prototype.valueOf,
+    Boolean.prototype.toString,
+    Boolean.prototype.valueOf,
+    BigInt.prototype.toString,
+    BigInt.prototype.valueOf,
+    RegExp.prototype.toString,
+    Error.prototype.toString
+]);
+
 const INTERPRETER_FUNCTIONS = new WeakSet<Function>();
 
 /**
@@ -247,7 +302,7 @@ function assertSafeCallbackArguments(fn: Function, args: readonly unknown[], opt
         if (isNativeFunction(argument) || isInterpreterFunction(argument)) {
             continue;
         }
-        if (isMethodAllowed(argumentName, options)) {
+        if (isMethodNameAllowed(argumentName, options)) {
             continue;
         }
         fail('Calling custom methods is not allowed.');
@@ -255,10 +310,25 @@ function assertSafeCallbackArguments(fn: Function, args: readonly unknown[], opt
 }
 
 /**
- * Prevents `join`/`toLocaleString` from invoking a custom `toString`/`valueOf`/
- * `toLocaleString` hook on an element, which would bypass the method policy.
+ * Prevents native methods from invoking a custom coercion hook on an element,
+ * a receiver or an argument, which would bypass the method policy.
+ *
+ * Coercion can be triggered by `toString`/`valueOf`/`toLocaleString`, by the
+ * `Symbol.toPrimitive` protocol, and (for `concat`) by
+ * `Symbol.isConcatSpreadable`, so all of them are inspected. Arguments are
+ * validated for every native call because most built-ins coerce at least one
+ * parameter (separators, replacements, padding strings, indexes, keys, …).
  */
-function assertSafeCoercion(fn: Function, thisArg: unknown, options?: FGDynamicExpressionOptions): void {
+function assertSafeCoercion(
+    fn: Function,
+    thisArg: unknown,
+    args: readonly unknown[],
+    options?: FGDynamicExpressionOptions
+): void {
+    for (const argument of args) {
+        assertSafeCoercionValue(argument, options, false);
+    }
+
     if (fn === Array.prototype.join || fn === Array.prototype.toString) {
         forEachArrayElement(thisArg, (value: unknown): void => assertSafeCoercionValue(value, options, false));
         return;
@@ -310,10 +380,18 @@ function assertSafeCoercionValue(value: unknown, options: FGDynamicExpressionOpt
         return;
     }
 
-    const methods = locale ? ['toLocaleString', 'toString', 'valueOf'] : ['toString', 'valueOf'];
+    // Interpreter arrows and allowlisted built-ins stringify natively. A custom
+    // host function must still be rejected below, so its source cannot leak.
+    if (typeof value === 'function' && (isInterpreterFunction(value) || isNativeFunction(value))) {
+        return;
+    }
 
-    for (const method of methods) {
-        const descriptor = findPropertyDescriptor(value, method);
+    const hooks: readonly (string | symbol)[] = locale
+        ? ['toLocaleString', 'toString', 'valueOf', Symbol.toPrimitive, Symbol.isConcatSpreadable]
+        : ['toString', 'valueOf', Symbol.toPrimitive, Symbol.isConcatSpreadable];
+
+    for (const hookName of hooks) {
+        const descriptor = findPropertyDescriptor(value, hookName);
         if (!descriptor) {
             continue;
         }
@@ -321,17 +399,21 @@ function assertSafeCoercionValue(value: unknown, options: FGDynamicExpressionOpt
             fail('Access to accessor properties is not allowed.');
         }
         const hook = descriptor.value;
-        if (typeof hook === 'function'
-            && !isNativeFunction(hook)
-            && !isInterpreterFunction(hook)
-            && !isMethodAllowed(method, options)) {
-            fail('Calling custom methods is not allowed.');
+        if (typeof hook !== 'function'
+            || isNativeFunction(hook)
+            || isInterpreterFunction(hook)
+            || SAFE_COERCION_HOOKS.has(hook)) {
+            continue;
         }
+        if (typeof hookName === 'string' && isMethodNameAllowed(hookName, options)) {
+            continue;
+        }
+        fail('Calling custom methods is not allowed.');
     }
 }
 
 /** Finds an own or inherited data descriptor without reading the property. */
-function findPropertyDescriptor(value: object, property: string): PropertyDescriptor | undefined {
+function findPropertyDescriptor(value: object, property: PropertyKey): PropertyDescriptor | undefined {
     let current: object | null = value;
 
     while (current) {
@@ -400,7 +482,21 @@ function isHostObject(value: unknown): boolean {
     }
 
     try {
-        const tag = Object.prototype.toString.call(value).slice(8, -1);
+        const tagDescriptor = findPropertyDescriptor(value as object, Symbol.toStringTag);
+
+        let tag: string;
+
+        if (tagDescriptor) {
+            // Never run an accessor while classifying an untrusted value.
+            if (!('value' in tagDescriptor) || typeof tagDescriptor.value !== 'string') {
+                return true;
+            }
+            tag = tagDescriptor.value;
+        } else {
+            // No `Symbol.toStringTag` anywhere in the prototype chain, so this
+            // call cannot invoke a getter.
+            tag = Object.prototype.toString.call(value).slice(8, -1);
+        }
 
         if (HOST_OBJECT_TAGS.has(tag)) {
             return true;
@@ -478,6 +574,10 @@ type Node =
 interface EvaluationState {
     steps: number;
     depth: number;
+    /** The genuine `$vm` capability passed by the host, if any. */
+    rootVm?: unknown;
+    /** Values returned by calling the root `$vm` capability during evaluation. */
+    rootVmValues: WeakSet<object>;
 }
 
 export class FGDynamicExpressionError extends Error {
@@ -720,7 +820,11 @@ class ExpressionParser {
         const params: string[] = [];
 
         if (this.current().type === 'identifier') {
-            params.push(this.advance().value);
+            const parameter = this.advance().value;
+            if (FORBIDDEN_PROPERTIES.has(parameter) || RESERVED_BINDING_NAMES.has(parameter)) {
+                fail('Forbidden arrow function parameter name.');
+            }
+            params.push(parameter);
         } else {
             this.expectPunctuator('(');
             if (!isPunctuator(this.current(), ')')) {
@@ -732,7 +836,7 @@ class ExpressionParser {
                     if (parameter.type !== 'identifier') {
                         fail('Arrow function parameters must be identifiers.');
                     }
-                    if (FORBIDDEN_PROPERTIES.has(parameter.value)) {
+                    if (FORBIDDEN_PROPERTIES.has(parameter.value) || RESERVED_BINDING_NAMES.has(parameter.value)) {
                         fail('Forbidden arrow function parameter name.');
                     }
                     params.push(parameter.value);
@@ -1099,11 +1203,70 @@ function assertSafeProperty(property: string): void {
     }
 }
 
-function isMethodAllowed(name: string, options?: FGDynamicExpressionOptions): boolean {
+/** Name-only check used for coercion and callback hooks, independent of receiver. */
+function isMethodNameAllowed(name: string, options?: FGDynamicExpressionOptions): boolean {
     if (options?.allowCustomMethods === true) {
         return true;
     }
-    return Array.isArray(options?.allowedMethods) && options!.allowedMethods!.includes(name);
+    if (!Array.isArray(options?.allowedMethods)) {
+        return false;
+    }
+    return options!.allowedMethods!.some((entry): boolean =>
+        typeof entry === 'string' ? entry === name : entry?.name === name
+    );
+}
+
+/** True when the receiver is the host `$vm` capability or a value it returned. */
+function isRootReceiver(receiver: unknown, state: EvaluationState): boolean {
+    if (receiver == null || (typeof receiver !== 'object' && typeof receiver !== 'function')) {
+        return false;
+    }
+    if (receiver === state.rootVm) {
+        return true;
+    }
+    return state.rootVmValues.has(receiver as object);
+}
+
+/**
+ * Receiver-aware capability check. Unscoped string entries only apply to the
+ * root `$vm` capability; `{ receiver: 'any' }` and `{ on }` opt into broader
+ * grants explicitly.
+ */
+function isMethodAllowedForReceiver(
+    name: string,
+    receiver: unknown,
+    state: EvaluationState,
+    options?: FGDynamicExpressionOptions
+): boolean {
+    if (options?.allowCustomMethods === true) {
+        return true;
+    }
+    if (!Array.isArray(options?.allowedMethods)) {
+        return false;
+    }
+
+    for (const entry of options!.allowedMethods!) {
+        if (typeof entry === 'string') {
+            if (entry === name && isRootReceiver(receiver, state)) {
+                return true;
+            }
+            continue;
+        }
+        if (entry == null || entry.name !== name) {
+            continue;
+        }
+        if (entry.on !== undefined) {
+            if (receiver === entry.on) {
+                return true;
+            }
+            continue;
+        }
+        if ((entry.receiver ?? 'root') === 'any' || isRootReceiver(receiver, state)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 function defineSafeProperty(target: Record<string, unknown>, key: string, value: unknown): void {
@@ -1116,7 +1279,7 @@ function defineSafeProperty(target: Record<string, unknown>, key: string, value:
     });
 }
 
-function readMember(target: unknown, key: unknown, optional: boolean, options?: FGDynamicExpressionOptions): unknown {
+function readMember(target: unknown, key: unknown, optional: boolean, state: EvaluationState, options?: FGDynamicExpressionOptions): unknown {
     if (target === OPTIONAL_SHORT_CIRCUIT) {
         return target;
     }
@@ -1152,7 +1315,7 @@ function readMember(target: unknown, key: unknown, optional: boolean, options?: 
         if (typeof value === 'function'
             && !isNativeFunction(value)
             && !isInterpreterFunction(value)
-            && !isMethodAllowed(property, options)) {
+            && !isMethodAllowedForReceiver(property, target, state, options)) {
             fail('Access to custom methods is not allowed.');
         }
         return assertSafeValue(value);
@@ -1169,7 +1332,7 @@ function readMember(target: unknown, key: unknown, optional: boolean, options?: 
             }
             const inherited = inheritedDescriptor.value;
             if (typeof inherited === 'function') {
-                if (isNativeFunction(inherited) || isInterpreterFunction(inherited) || isMethodAllowed(property, options)) {
+                if (isNativeFunction(inherited) || isInterpreterFunction(inherited) || isMethodAllowedForReceiver(property, target, state, options)) {
                     return inherited;
                 }
                 fail('Access to custom methods is not allowed.');
@@ -1184,7 +1347,13 @@ function readMember(target: unknown, key: unknown, optional: boolean, options?: 
 
 function spreadValues(value: unknown): unknown[] {
     if (Array.isArray(value)) {
-        return value.slice();
+        // Descriptor iteration avoids invoking an overridden `slice` on an
+        // Array subclass supplied by the view model.
+        const values: unknown[] = [];
+        forEachArrayElement(value, (element: unknown): void => {
+            values.push(element);
+        });
+        return values;
     }
     if (typeof value === 'string') {
         if (value.length > MAX_STRING_LENGTH) {
@@ -1274,7 +1443,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                     return object;
                 }
                 const key = normalizeOptional(evaluateNode(node.property, environment, state, options));
-                return readMember(object, key, node.optional, options);
+                return readMember(object, key, node.optional, state, options);
             }
 
             case 'Call': {
@@ -1288,7 +1457,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                         return object;
                     }
                     const key = normalizeOptional(evaluateNode(node.callee.property, environment, state, options));
-                    fn = readMember(object, key, node.callee.optional, options);
+                    fn = readMember(object, key, node.callee.optional, state, options);
                     thisArg = object;
                     methodName = String(key);
                 } else {
@@ -1323,12 +1492,16 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 if (node.callee.type === 'Member') {
                     if (!isNativeFunction(fn)
                         && !isInterpreterFunction(fn)
-                        && !isMethodAllowed(methodName ?? '', options)) {
+                        && !isMethodAllowedForReceiver(methodName ?? '', thisArg, state, options)) {
                         return fail('Calling custom methods is not allowed.');
                     }
                 } else {
-                    const isVmCall = node.callee.type === 'Identifier' && node.callee.name === '$vm';
-                    if (!isVmCall && !isInterpreterFunction(fn) && !isMethodAllowed('', options)) {
+                    // Only the genuine `$vm` capability may be called directly.
+                    // A same-named arrow parameter must never unlock this path.
+                    const isVmCall = node.callee.type === 'Identifier'
+                        && node.callee.name === '$vm'
+                        && fn === state.rootVm;
+                    if (!isVmCall && !isInterpreterFunction(fn)) {
                         return fail('Calling custom functions is not allowed.');
                     }
                 }
@@ -1346,7 +1519,7 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 // Native higher-order methods and coercing methods must not
                 // launder custom functions past the callee policy.
                 assertSafeCallbackArguments(fn, args, options);
-                assertSafeCoercion(fn, thisArg, options);
+                assertSafeCoercion(fn, thisArg, args, options);
 
                 // Bound native string builders before they allocate.
                 if (fn === String.prototype.repeat) {
@@ -1410,6 +1583,14 @@ function evaluateNode(node: Node, environment: Map<string, unknown>, state: Eval
                 }
 
                 const result = (fn as (...args: unknown[]) => unknown).apply(thisArg, args);
+
+                // Track view-model values produced by the genuine `$vm`
+                // capability so root-scoped method grants work even when the
+                // wrapper returns a fresh object on every call.
+                if (fn === state.rootVm && result !== null
+                    && (typeof result === 'object' || typeof result === 'function')) {
+                    state.rootVmValues.add(result as object);
+                }
 
                 if (typeof result === 'string' && result.length > MAX_STRING_LENGTH) {
                     return fail('Expression result is too large.');
@@ -1586,5 +1767,12 @@ export function evaluateSafeExpression(
         environment.set(key, value);
     }
 
-    return assertSafeValue(normalizeOptional(evaluateNode(ast, environment, { steps: 0, depth: 0 }, options)));
+    const state: EvaluationState = {
+        steps: 0,
+        depth: 0,
+        rootVm: variables['$vm'],
+        rootVmValues: new WeakSet<object>()
+    };
+
+    return assertSafeValue(normalizeOptional(evaluateNode(ast, environment, state, options)));
 }
