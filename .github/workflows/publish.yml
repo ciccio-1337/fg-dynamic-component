@@ -2,6 +2,9 @@ name: Publish to NPM
 on:
   release:
     types: [created]
+  # Manual runs exercise the whole pipeline but only pack the tarball
+  # (`npm publish --dry-run`), so nothing is published.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,10 +37,19 @@ jobs:
       # repository, the `publish.yml` workflow and the `npm-publish`
       # environment on npmjs.com; no npm token is used.
       - name: Publish package on NPM 📦
+        env:
+          # Kept out of the script body to avoid expression interpolation
+          # into the shell command.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: |
           cd dist/fg-dynamic-component
           if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
             echo "NODE_AUTH_TOKEN must be unset for OIDC trusted publishing." >&2
             exit 1
           fi
-          npm publish --access=public --provenance --ignore-scripts
+          if [ -n "$DRY_RUN" ]; then
+            echo "Manual run: npm publish --dry-run, nothing is published."
+            npm publish --access=public --ignore-scripts --dry-run
+          else
+            npm publish --access=public --provenance --ignore-scripts
+          fi
