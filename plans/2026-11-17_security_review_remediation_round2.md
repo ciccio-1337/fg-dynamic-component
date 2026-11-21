@@ -51,8 +51,13 @@ expression, attribute and form features, and add regression coverage for each.
 
 ### S-6 (`.github/workflows/publish.yml`)
 
-- Remove the `NODE_AUTH_TOKEN` fallback and its comment; rely on npm trusted publishing
-  (OIDC) with `--provenance --ignore-scripts`.
+- Remove the `NODE_AUTH_TOKEN` fallback and rely on npm trusted publishing (OIDC)
+  with `--provenance --ignore-scripts`.
+- Drop `registry-url` from `actions/setup-node`: it exports a placeholder
+  `NODE_AUTH_TOKEN` (`XXXXX-XXXXX-XXXXX-XXXXX`) that makes npm skip OIDC and fail
+  with a 404. The publish step fails fast if a token is present.
+- Prerequisite: authorize repo `ciccio-1337/fg-dynamic-component`, workflow
+  `publish.yml` and environment `npm-publish` on npmjs.com.
 
 ## Regression tests
 

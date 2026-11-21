@@ -21,7 +21,8 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '26.x'
-          registry-url: 'https://registry.npmjs.org'
+          # No `registry-url`: setup-node then exports a placeholder
+          # NODE_AUTH_TOKEN, which would disable OIDC trusted publishing.
           cache: npm
       - name: Install dependencies
         run: npm ci
@@ -29,7 +30,14 @@ jobs:
         run: npm run test -- --no-watch
       - name: Build 🔧
         run: npm run build
-      # Uses npm trusted publishing (OIDC) configured on npmjs.com. No long-lived
-      # token is exposed to the build output or to publish lifecycle scripts.
+      # npm trusted publishing (OIDC). The package must authorize this
+      # repository, the `publish.yml` workflow and the `npm-publish`
+      # environment on npmjs.com; no npm token is used.
       - name: Publish package on NPM 📦
-        run: cd dist/fg-dynamic-component && npm publish --access=public --provenance --ignore-scripts
+        run: |
+          cd dist/fg-dynamic-component
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NODE_AUTH_TOKEN must be unset for OIDC trusted publishing." >&2
+            exit 1
+          fi
+          npm publish --access=public --provenance --ignore-scripts
