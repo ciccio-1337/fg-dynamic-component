@@ -52,7 +52,7 @@ jobs:
             # throwaway version is required to avoid EPUBLISHCONFLICT.
             echo "Manual run: npm publish --dry-run, nothing is published."
             npm pkg set version="0.0.0-dryrun.${GITHUB_RUN_ID}"
-            npm publish --access=public --ignore-scripts --dry-run
+            npm publish --access=public --ignore-scripts --dry-run --tag dryrun
           else
             npm publish --access=public --provenance --ignore-scripts
           fi
