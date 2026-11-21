@@ -48,7 +48,10 @@ jobs:
             exit 1
           fi
           if [ -n "$DRY_RUN" ]; then
+            # `npm publish --dry-run` still runs the registry preflight, so a
+            # throwaway version is required to avoid EPUBLISHCONFLICT.
             echo "Manual run: npm publish --dry-run, nothing is published."
+            npm pkg set version="0.0.0-dryrun.${GITHUB_RUN_ID}"
             npm publish --access=public --ignore-scripts --dry-run
           else
             npm publish --access=public --provenance --ignore-scripts
